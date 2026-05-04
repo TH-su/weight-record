@@ -498,6 +498,26 @@ textarea{resize:vertical;min-height:60px}
 .bd-era-y:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px rgba(26,115,232,.15)}
 .bd-era-hint{font-size:10px;color:var(--g6);margin-left:4px}
 
+/* 退去者表示 */
+.md-discharge-banner{margin:8px 12px 0;padding:8px 12px;background:#fff3e0;border:1px solid #ffb74d;
+  border-radius:8px;color:#e65100;font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}
+.md-discharge-banner .dc-ic{font-size:16px}
+.md-discharge-banner .dc-msg{flex:1}
+/* mdDischarge ボタンは bn bo (orange) を継承 */
+#mdDischarge.is-restore{background:#fff;color:var(--ok);border-color:var(--ok)}
+#mdDischarge.is-restore:hover{background:rgba(46,125,50,.08)}
+
+/* cfg リストの退去者行 */
+.rli.rli-discharged{opacity:.62;background:#fafafa}
+.rli.rli-discharged .rli-n{color:var(--g7)}
+.rli .rli-tag-discharged{display:inline-block;margin-left:8px;padding:1px 8px;border-radius:8px;
+  font-size:10px;font-weight:700;background:#fff3e0;color:#e65100;vertical-align:middle}
+.rli-section-divider{margin:12px 0 6px;padding:6px 10px;border-top:1px dashed var(--g3);
+  font-size:11px;font-weight:700;color:var(--g6);background:transparent}
+
+/* dropdown の退去者表記 */
+select option.is-discharged{color:var(--g6)}
+
 /* loading overlay */
 .ld-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:600;
   align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:pointer}
@@ -1061,9 +1081,15 @@ textarea{resize:vertical;min-height:60px}
         <textarea id="mdNote" placeholder="アレルギー・持病など"></textarea>
       </div>
     </div>
+    <!-- 退去者の場合に表示するバナー（編集時のみ） -->
+    <div id="mdDischargeBanner" class="md-discharge-banner" style="display:none">
+      <span class="dc-ic">🏠</span>
+      <span class="dc-msg" id="mdDischargeMsg"></span>
+    </div>
     <div class="mk-f">
       <button class="bn bs" data-close>キャンセル</button>
       <button class="bn br" id="mdDel" style="display:none">削除</button>
+      <button class="bn bo" id="mdDischarge" style="display:none">退去</button>
       <button class="bn bp" id="mdSave">保存</button>
     </div>
   </div>
@@ -1498,7 +1524,7 @@ async function syncFromAPI(showLoader){
       // 入居者セレクトも同期データに合わせて再構築
       if(typeof populateResidentSelect === 'function'){
         populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-        populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+        populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
       }
     }catch(e){ console.warn('post-sync render:', e); }
     flushPendingQueue();
@@ -1637,20 +1663,47 @@ function getAllRecordsOf(residentId){
 }
 function residentById(id){ return DB.residents.find(r=>r.id===id); }
 
-function sortedResidents(){
-  return DB.residents.slice().sort((a,b)=>
-    (a.room||'').localeCompare(b.room||'','ja',{numeric:true}) || a.name.localeCompare(b.name,'ja')
+/* 退去（discharge）状態の判定。dischargedAt が空でない文字列なら退去済み。 */
+function isDischarged(r){
+  return !!(r && typeof r.dischargedAt === 'string' && r.dischargedAt);
+}
+
+/* 入居者の並び順を返す。
+   - opts.includeDischarged: 退去者も含める（既定 false）
+   - 退去者は常に末尾に並ぶ（活動中→退去者の順）
+   既存の name/room ロジックは維持。 */
+function sortedResidents(opts){
+  const include = !!(opts && opts.includeDischarged);
+  const list = (DB.residents || []).filter(r =>
+    r && typeof r === 'object' && (include || !isDischarged(r))
   );
+  return list.slice().sort((a, b) => {
+    const ad = isDischarged(a) ? 1 : 0;
+    const bd = isDischarged(b) ? 1 : 0;
+    if(ad !== bd) return ad - bd;  // 活動中を先、退去者を後ろに
+    const roomCmp = (a.room||'').localeCompare(b.room||'', 'ja', {numeric:true});
+    if(roomCmp !== 0) return roomCmp;
+    return (a.name||'').localeCompare(b.name||'', 'ja');
+  });
 }
 function populateResidentSelect(sel, opts={}){
+  if(!sel) return '';
   const keep = sel.value;
-  const list = sortedResidents();
+  const list = sortedResidents({ includeDischarged: !!opts.includeDischarged });
   sel.innerHTML = '<option value="">選択してください</option>' +
-    list.map(r=>`<option value="${r.id}">${r.room?`[${r.room}] `:''}${r.name}</option>`).join('');
+    list.map(r=>{
+      const tag = isDischarged(r) ? '[退去] ' : '';
+      const cls = isDischarged(r) ? ' class="is-discharged"' : '';
+      return `<option value="${r.id}"${cls}>${tag}${r.room?`[${r.room}] `:''}${r.name||''}</option>`;
+    }).join('');
   let restore = keep;
-  if(!restore || !residentById(restore)) restore = opts.preferId || '';
-  if(!restore || !residentById(restore)) restore = opts.fallbackFirst && list[0] ? list[0].id : '';
-  sel.value = restore;
+  // 復元したい ID が「現在のオプション一覧」に存在するか確認する。
+  // 例：退去者を除外する select で、保存値が退去者を指していたら別を選ぶ。
+  const inListIds = new Set(list.map(r=>r.id));
+  const isInList = id => id && inListIds.has(id);
+  if(!isInList(restore)) restore = opts.preferId && isInList(opts.preferId) ? opts.preferId : '';
+  if(!restore && opts.fallbackFirst && list[0]) restore = list[0].id;
+  sel.value = restore || '';
   return sel.value;
 }
 
@@ -1779,11 +1832,8 @@ $('#listFilter').addEventListener('click', e=>{
 
 function renderList(){
   const body = $('#listBody');
-  const residents = [...DB.residents].sort((a,b)=>{
-    const ra = a.room||'', rb = b.room||'';
-    if(ra !== rb) return ra.localeCompare(rb, 'ja', {numeric:true});
-    return a.name.localeCompare(b.name, 'ja');
-  });
+  // 退去者は一覧から除外（履歴は個別画面・設定画面から参照可能）
+  const residents = sortedResidents();
   body.innerHTML = '';
   let shown = 0;
 
@@ -2994,7 +3044,7 @@ function recordsForRange(rid){
 const RANGE_TITLES = { w1:'過去1週間の推移', m1:'過去1ヶ月の推移', y1:'過去1年の推移' };
 
 function renderIndiv(){
-  const rid = populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+  const rid = populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
   syncChartVisibility();
   $('#ivChartTtl').textContent = RANGE_TITLES[ivRange] || '推移';
 
@@ -3301,8 +3351,10 @@ $('#alFilter').addEventListener('click', e=>{
 
 function collectAlerts(){
   // pick most recent record per resident and analyze
+  // 退去者は対象外（既に施設にいないため、変動を通知する意味がない）
   const out = [];
   for(const r of DB.residents){
+    if(isDischarged(r)) continue;
     const recs = getRecordsOf(r.id);
     if(recs.length===0) continue;
     const last = recs[recs.length-1];
@@ -3604,47 +3656,68 @@ function renderCfg(){
     return;
   }
 
-  // 3) 表示用に name/room を文字列化（破壊的変更を避けるため shallow clone）
+  // 3) 表示用に name/room を文字列化（破壊的変更を避けるため shallow clone）。
+  //    退去フラグも shallow に持ち回す。
   const safe = valid.map(r => Object.assign({}, r, {
     name: (typeof r.name === 'string' && r.name) ? r.name : '（名前未設定）',
     room: (typeof r.room === 'string') ? r.room : '',
+    _discharged: isDischarged(r),
+    _dischargedAt: r.dischargedAt || '',
   }));
 
-  // 4) 部屋番号→名前 で安全にソート（比較対象の片方が undefined でも例外を出さない）
-  let sorted;
-  try{
-    sorted = safe.slice().sort((a, b) => {
-      const ar = a.room || '', br = b.room || '';
-      const roomCmp = ar.localeCompare(br, 'ja', { numeric: true });
-      if(roomCmp !== 0) return roomCmp;
-      return a.name.localeCompare(b.name, 'ja');
-    });
-  }catch(e){
-    console.warn('renderCfg sort failed, falling back to insertion order:', e);
-    sorted = safe.slice();
+  // 4) 活動中／退去者で2グループに分け、それぞれを部屋番号→名前で安全にソート。
+  //    （活動中を上、退去者を下に表示する）
+  function safeSort(arr){
+    try{
+      return arr.slice().sort((a, b) => {
+        const roomCmp = (a.room||'').localeCompare(b.room||'', 'ja', { numeric: true });
+        if(roomCmp !== 0) return roomCmp;
+        return (a.name||'').localeCompare(b.name||'', 'ja');
+      });
+    }catch(e){
+      console.warn('renderCfg sort failed, falling back to insertion order:', e);
+      return arr.slice();
+    }
+  }
+  const active     = safeSort(safe.filter(r => !r._discharged));
+  const discharged = safeSort(safe.filter(r =>  r._discharged));
+
+  // 5) 行を組み立てる関数（1件ずつ try/catch で囲み、1件壊れても他は出るように）
+  function appendRows(arr, frag){
+    for(const r of arr){
+      try{
+        const n = DB.records ? DB.records.filter(x => x && x.residentId === r.id).length : 0;
+        const hStr = (r.heightCm ? `身長 ${r.heightCm}cm / ` : '') + (r.wheelchairKg ? `車椅子 ${r.wheelchairKg}kg / ` : '');
+        const div = document.createElement('div');
+        div.className = r._discharged ? 'rli rli-discharged' : 'rli';
+        const dcTag = r._discharged
+          ? `<span class="rli-tag-discharged" title="${escapeHtml(r._dischargedAt)} 退去">退去 ${escapeHtml(r._dischargedAt)}</span>`
+          : '';
+        div.innerHTML = `
+          <div class="rli-l">
+            <div class="rli-n">${escapeHtml(r.name)}${dcTag}</div>
+            <div class="rli-s">${r.room ? '部屋 ' + escapeHtml(r.room) + ' / ' : ''}${hStr}記録 ${n} 件</div>
+          </div>
+          <div class="rli-btns">
+            <button class="bn bo bsm" data-ed="${escapeHtml(r.id)}">編集</button>
+          </div>
+        `;
+        frag.appendChild(div);
+      }catch(e){
+        console.warn('renderCfg row failed for id=', r && r.id, e);
+      }
+    }
   }
 
-  // 5) 1件ずつ try/catch で囲んで描画する。1件壊れても他は出る。
   const frag = document.createDocumentFragment();
-  for(const r of sorted){
-    try{
-      const n = DB.records ? DB.records.filter(x => x && x.residentId === r.id).length : 0;
-      const hStr = (r.heightCm ? `身長 ${r.heightCm}cm / ` : '') + (r.wheelchairKg ? `車椅子 ${r.wheelchairKg}kg / ` : '');
-      const div = document.createElement('div');
-      div.className = 'rli';
-      div.innerHTML = `
-        <div class="rli-l">
-          <div class="rli-n">${escapeHtml(r.name)}</div>
-          <div class="rli-s">${r.room ? '部屋 ' + escapeHtml(r.room) + ' / ' : ''}${hStr}記録 ${n} 件</div>
-        </div>
-        <div class="rli-btns">
-          <button class="bn bo bsm" data-ed="${escapeHtml(r.id)}">編集</button>
-        </div>
-      `;
-      frag.appendChild(div);
-    }catch(e){
-      console.warn('renderCfg row failed for id=', r && r.id, e);
-    }
+  appendRows(active, frag);
+
+  if(discharged.length > 0){
+    const divider = document.createElement('div');
+    divider.className = 'rli-section-divider';
+    divider.textContent = `退去者 (${discharged.length}名) — 各画面から非表示・データは保持`;
+    frag.appendChild(divider);
+    appendRows(discharged, frag);
   }
   list.appendChild(frag);
 
@@ -3734,6 +3807,30 @@ function openResident(id){
   $('#mdNote').value = r?.note || '';
   // load meal-form widgets from resident's saved settings
   loadResidentMealIntoMd(r);
+  // 退去状態のバナーとボタン表示
+  const banner   = $('#mdDischargeBanner');
+  const bMsg     = $('#mdDischargeMsg');
+  const dischBtn = $('#mdDischarge');
+  if(id && r){
+    const discharged = isDischarged(r);
+    if(banner){
+      banner.style.display = discharged ? '' : 'none';
+      if(bMsg) bMsg.textContent = discharged
+        ? `この入居者は ${r.dischargedAt} に退去済み（一覧・入力・集計から非表示。データは保持）`
+        : '';
+    }
+    if(dischBtn){
+      dischBtn.style.display = '';
+      dischBtn.textContent = discharged ? '復帰' : '退去';
+      dischBtn.classList.toggle('is-restore', discharged);
+      dischBtn.title = discharged
+        ? '退去状態を解除して通常の入居者に戻す'
+        : 'データを残したまま「退去」にし、各画面から非表示にする';
+    }
+  } else {
+    if(banner)   banner.style.display = 'none';
+    if(dischBtn) dischBtn.style.display = 'none';
+  }
   $('#mdDel').style.display = id ? '' : 'none';
   $('#mdResident').classList.add('on');
   setTimeout(()=> $('#mdName').focus(), 50);
@@ -3920,10 +4017,53 @@ $('#mdSave').addEventListener('click', ()=>{
   $('#mdResident').classList.remove('on');
   renderCfg();
   populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-  populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+  populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
   // refresh the read-only meal display in case the user edited the
   // currently-selected resident from the input screen.
   if(typeof renderInputMealDisplay === 'function') renderInputMealDisplay();
+});
+
+/* 退去 / 復帰 ボタン
+   - 退去：dischargedAt を本日の日付（YYYY-MM-DD）にセット → 一覧/入力/集計/
+     一括/アラートから非表示。設定と個別では引き続き参照可能。
+   - 復帰：dischargedAt をクリアして通常の入居者に戻す。
+   - 体重記録は一切削除しない（退去後も履歴アクセス可能）。 */
+$('#mdDischarge').addEventListener('click', ()=>{
+  if(!editingId) return;
+  const r = residentById(editingId);
+  if(!r){ toast('入居者が見つかりません','err'); return; }
+  const wasDischarged = isDischarged(r);
+  if(wasDischarged){
+    if(!confirm(`${r.name} の退去を取り消し、通常の入居者として復帰させます。よろしいですか？`)) return;
+    delete r.dischargedAt;
+    r.updatedAt = new Date().toISOString();
+    save();
+    apiPush('saveResident', { resident: r });
+    toast('復帰しました');
+  } else {
+    const n = (DB.records || []).filter(x=> x && x.residentId===editingId).length;
+    if(!confirm(
+      `${r.name} を退去にします。\n` +
+      `・体重記録 ${n} 件はそのまま保持されます\n` +
+      `・一覧・入力・集計・アラート画面から非表示になります\n` +
+      `・個別画面と設定画面では引き続き参照・編集できます\n\n` +
+      `続行しますか？`
+    )) return;
+    r.dischargedAt = new Date().toISOString().slice(0,10);
+    r.updatedAt = new Date().toISOString();
+    save();
+    apiPush('saveResident', { resident: r });
+    // 入力・個別画面で退去者を選択していた場合はクリアして混乱を防ぐ
+    if(UI.inRes === editingId) saveUI({inRes: ''});
+    toast(`${r.name} を退去にしました`);
+  }
+  $('#mdResident').classList.remove('on');
+  renderCfg();
+  populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+  populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+  if(typeof renderList === 'function') renderList();
+  if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
+  if(typeof updateAlertBadge === 'function') updateAlertBadge();
 });
 
 $('#mdDel').addEventListener('click', ()=>{
@@ -3943,7 +4083,7 @@ $('#mdDel').addEventListener('click', ()=>{
   $('#mdResident').classList.remove('on');
   renderCfg();
   populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-  populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+  populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
   toast('削除しました');
 });
 
@@ -3982,7 +4122,7 @@ $('#cfgFile').addEventListener('change', async e=>{
     if(finalUrl) saveApiUrl(finalUrl);  // 一次LSにも反映
     renderCfg(); updateAlertBadge();
     populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-    populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+    populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
     toast('インポートしました');
   }catch(err){
     toast('ファイルを読み込めませんでした','err');
@@ -4099,7 +4239,7 @@ $('#cfgSample').addEventListener('click', ()=>{
   });
   save(); renderCfg(); updateAlertBadge();
   populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-  populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+  populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
   toast('サンプルを投入しました');
 });
 
@@ -4201,7 +4341,7 @@ $('#cfgSample').addEventListener('click', ()=>{
 // the user switches tabs (prevents selection from appearing empty
 // after a page reload).
 populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
 goto(['list','input','indiv','grid','alert','cfg'].includes(UI.tab) ? UI.tab : 'list');
 updateAlertBadge();
 
