@@ -1492,6 +1492,14 @@ async function syncFromAPI(showLoader){
       if(typeof renderAlerts === 'function')renderAlerts();
       if(typeof updateAlertBadge === 'function') updateAlertBadge();
       if(typeof renderInputExistingList === 'function') renderInputExistingList();
+      // 設定画面の入居者一覧も同期完了で更新する（別端末で追加された入居者が
+      // この端末の設定画面を開いていても即座に反映されるように）
+      if(typeof renderCfg === 'function') renderCfg();
+      // 入居者セレクトも同期データに合わせて再構築
+      if(typeof populateResidentSelect === 'function'){
+        populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+        populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
+      }
     }catch(e){ console.warn('post-sync render:', e); }
     flushPendingQueue();
     return true;
@@ -3569,33 +3577,79 @@ $('#inMealEdit')?.addEventListener('click', ()=>{
 });
 
 function renderCfg(){
-  renderThrEditor();
+  // 設定画面の入居者一覧。長期運用で混入し得る欠損データ（name 欠落・id 欠落・null
+  // 要素・サーバ由来の不完全行など）を1件たりとも例外で落とさず、必ず描画完了する。
   const list = $('#cfgList');
+  if(!list) return;  // cfg 画面 DOM が未ロード（保険）
+  try{ renderThrEditor(); }catch(e){ console.warn('renderThrEditor:', e); }
+
+  // 1) 不正エントリを除外して妥当な配列を作る（id が文字列であることを必須とする）
+  const all = Array.isArray(DB.residents) ? DB.residents : [];
+  const valid = [];
+  let dropped = 0;
+  for(const r of all){
+    if(r && typeof r === 'object' && typeof r.id === 'string' && r.id){
+      valid.push(r);
+    } else {
+      dropped++;
+    }
+  }
+  if(dropped) console.warn(`renderCfg: skipped ${dropped} malformed resident entries`);
+
+  // 2) 描画前に list を一掃
   list.innerHTML = '';
-  if(DB.residents.length===0){
+
+  if(valid.length === 0){
     list.innerHTML = `<div class="empty">入居者が登録されていません。<br>「＋ 追加」または「サンプル投入」から開始してください。</div>`;
     return;
   }
-  DB.residents
-    .slice()
-    .sort((a,b)=>(a.room||'').localeCompare(b.room||'','ja',{numeric:true})||a.name.localeCompare(b.name,'ja'))
-    .forEach(r=>{
-      const n = DB.records.filter(x=>x.residentId===r.id).length;
+
+  // 3) 表示用に name/room を文字列化（破壊的変更を避けるため shallow clone）
+  const safe = valid.map(r => Object.assign({}, r, {
+    name: (typeof r.name === 'string' && r.name) ? r.name : '（名前未設定）',
+    room: (typeof r.room === 'string') ? r.room : '',
+  }));
+
+  // 4) 部屋番号→名前 で安全にソート（比較対象の片方が undefined でも例外を出さない）
+  let sorted;
+  try{
+    sorted = safe.slice().sort((a, b) => {
+      const ar = a.room || '', br = b.room || '';
+      const roomCmp = ar.localeCompare(br, 'ja', { numeric: true });
+      if(roomCmp !== 0) return roomCmp;
+      return a.name.localeCompare(b.name, 'ja');
+    });
+  }catch(e){
+    console.warn('renderCfg sort failed, falling back to insertion order:', e);
+    sorted = safe.slice();
+  }
+
+  // 5) 1件ずつ try/catch で囲んで描画する。1件壊れても他は出る。
+  const frag = document.createDocumentFragment();
+  for(const r of sorted){
+    try{
+      const n = DB.records ? DB.records.filter(x => x && x.residentId === r.id).length : 0;
       const hStr = (r.heightCm ? `身長 ${r.heightCm}cm / ` : '') + (r.wheelchairKg ? `車椅子 ${r.wheelchairKg}kg / ` : '');
       const div = document.createElement('div');
       div.className = 'rli';
       div.innerHTML = `
         <div class="rli-l">
           <div class="rli-n">${escapeHtml(r.name)}</div>
-          <div class="rli-s">${r.room?'部屋 '+escapeHtml(r.room)+' / ':''}${hStr}記録 ${n} 件</div>
+          <div class="rli-s">${r.room ? '部屋 ' + escapeHtml(r.room) + ' / ' : ''}${hStr}記録 ${n} 件</div>
         </div>
         <div class="rli-btns">
-          <button class="bn bo bsm" data-ed="${r.id}">編集</button>
+          <button class="bn bo bsm" data-ed="${escapeHtml(r.id)}">編集</button>
         </div>
       `;
-      list.appendChild(div);
-    });
-  $$('#cfgList [data-ed]').forEach(b=> b.addEventListener('click', ()=> openResident(b.dataset.ed)));
+      frag.appendChild(div);
+    }catch(e){
+      console.warn('renderCfg row failed for id=', r && r.id, e);
+    }
+  }
+  list.appendChild(frag);
+
+  // 6) 編集ボタンをワイヤリング
+  $$('#cfgList [data-ed]').forEach(b => b.addEventListener('click', () => openResident(b.dataset.ed)));
 }
 
 /* --- alert threshold editor --- */
