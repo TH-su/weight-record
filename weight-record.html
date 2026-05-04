@@ -471,6 +471,33 @@ textarea{resize:vertical;min-height:60px}
 .api-help code{background:var(--g1);padding:1px 5px;border-radius:4px;font-size:10px;
   font-family:ui-monospace,Menlo,Consolas,monospace}
 
+/* 生年月日 三分割入力 + 和暦ヘルパー */
+.bd-trio{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.bd-trio input{font-family:inherit;font-size:14px;font-weight:700;text-align:center;
+  padding:6px 4px;border:1px solid var(--g3);border-radius:6px;background:#fff;
+  font-variant-numeric:tabular-nums;transition:border-color .12s,box-shadow .12s;min-width:0}
+.bd-trio input:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px rgba(26,115,232,.15)}
+.bd-trio input.bd-err{border-color:var(--ng);box-shadow:0 0 0 3px rgba(198,40,40,.15)}
+.bd-trio #mdBirthY{width:64px}
+.bd-trio #mdBirthM,.bd-trio #mdBirthD{width:42px}
+.bd-trio .bd-sep{font-size:12px;color:var(--g6);font-weight:400}
+.bd-age{display:inline-block;margin-left:6px;font-size:11px;font-weight:700;color:var(--pri-d);
+  background:var(--pri-l);padding:1px 8px;border-radius:8px;vertical-align:baseline}
+.bd-age:empty{display:none}
+.bd-eras{margin-top:6px;display:flex;align-items:center;gap:4px;flex-wrap:wrap;font-size:11px}
+.bd-era-lbl{color:var(--g6);font-size:10px;font-weight:700;margin-right:2px}
+.bd-era-b{font-family:inherit;font-size:11px;font-weight:700;padding:3px 9px;
+  border:1px solid var(--g3);border-radius:11px;background:#fff;color:var(--g8);
+  cursor:pointer;transition:all .12s}
+.bd-era-b:hover{border-color:var(--pri);color:var(--pri-d);background:var(--pri-l)}
+.bd-era-b.on{background:var(--pri);color:#fff;border-color:var(--pri)}
+.bd-era-y{font-family:inherit;font-size:13px;font-weight:700;text-align:center;width:54px;
+  padding:3px 4px;border:1px solid var(--g3);border-radius:6px;background:#fff;
+  font-variant-numeric:tabular-nums;transition:all .12s}
+.bd-era-y:disabled{background:var(--g1);color:var(--g5);cursor:not-allowed}
+.bd-era-y:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 3px rgba(26,115,232,.15)}
+.bd-era-hint{font-size:10px;color:var(--g6);margin-left:4px}
+
 /* loading overlay */
 .ld-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:600;
   align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:pointer}
@@ -965,8 +992,26 @@ textarea{resize:vertical;min-height:60px}
       </div>
       <div class="fr">
         <div class="fg">
-          <label class="fl">生年月日</label>
-          <input type="date" id="mdBirth">
+          <label class="fl">生年月日 <span class="bd-age" id="mdBirthAge"></span></label>
+          <div class="bd-trio">
+            <input type="text" id="mdBirthY" inputmode="numeric" maxlength="4" placeholder="1935" autocomplete="off">
+            <span class="bd-sep">年</span>
+            <input type="text" id="mdBirthM" inputmode="numeric" maxlength="2" placeholder="3" autocomplete="off">
+            <span class="bd-sep">月</span>
+            <input type="text" id="mdBirthD" inputmode="numeric" maxlength="2" placeholder="15" autocomplete="off">
+            <span class="bd-sep">日</span>
+          </div>
+          <div class="bd-eras">
+            <span class="bd-era-lbl">和暦：</span>
+            <button type="button" class="bd-era-b" data-era="T" title="大正 1912〜1926">大正</button>
+            <button type="button" class="bd-era-b" data-era="S" title="昭和 1926〜1989">昭和</button>
+            <button type="button" class="bd-era-b" data-era="H" title="平成 1989〜2019">平成</button>
+            <button type="button" class="bd-era-b" data-era="R" title="令和 2019〜">令和</button>
+            <input type="text" id="mdBirthEraY" inputmode="numeric" maxlength="2" placeholder="例：25" class="bd-era-y" disabled>
+            <span class="bd-era-hint" id="mdBirthEraHint">年号を選んで元号年を入力</span>
+          </div>
+          <!-- 既存の保存パスとの互換のため、ISO YYYY-MM-DD を hidden で保持 -->
+          <input type="hidden" id="mdBirth">
         </div>
         <div class="fg">
           <label class="fl">入居日</label>
@@ -1144,7 +1189,76 @@ let DB = load();
    ============================================================ */
 const API_KEY = 'wtmgr_api_url';
 const LS_PQ   = 'wtmgr_pq_v1';
-let apiUrl = localStorage.getItem(API_KEY) || '';
+
+/* GAS Web App URL の永続化
+   ------------------------------------------------------------
+   - localStorage[API_KEY]  : 一次保存（このアプリの軽量キー）
+   - DB.apiUrl              : 二次保存（DB と同じ wtmgr_v1 キー内）
+   両方に同時書き込みすることで、片方が消えても他方から復元できる。
+   想定される消失パターン：
+     * Safari ITP が 7日のアイドル後に個別 LS キーを消す
+     * ユーザが「全データ削除」を押す（DB は消えるが API_KEY は残る）
+     * ユーザが「JSON インポート」する（DB は置換、API_KEY は残る）
+   どのパターンでも、二箇所に書いていれば復元可能。
+
+   さらに setItem 後に getItem で読み戻して **検証** することで、
+   プライベートモード・容量超過・SW 介入などの「黙って失敗」を捕捉する。 */
+function saveApiUrl(url){
+  const v = (url || '').trim();
+  let lsOk = false, dbOk = false;
+  // 1) 一次保存: localStorage[API_KEY] と読み戻し検証
+  try{
+    if(v) localStorage.setItem(API_KEY, v);
+    else  localStorage.removeItem(API_KEY);
+    const verify = localStorage.getItem(API_KEY) || '';
+    lsOk = (verify === v);
+  }catch(e){
+    console.warn('saveApiUrl: localStorage failed:', e.message);
+    lsOk = false;
+  }
+  // 2) 二次保存: DB.apiUrl 経由で wtmgr_v1 キー内にも保存
+  try{
+    if(typeof DB === 'object' && DB){
+      DB.apiUrl = v;
+      save();
+      const cur = (DB && typeof DB.apiUrl === 'string') ? DB.apiUrl : '';
+      dbOk = (cur === v);
+    }
+  }catch(e){
+    console.warn('saveApiUrl: DB save failed:', e.message);
+    dbOk = false;
+  }
+  // 3) メモリ上の参照も更新
+  apiUrl = v;
+  return { ok: (lsOk || dbOk), lsOk, dbOk };
+}
+
+function clearApiUrl(){
+  return saveApiUrl('');
+}
+
+/* 起動時：一次が空なら二次（DB.apiUrl）から復元し、両方を再書き込み。
+   両方が一致しているのが正常状態なので、不一致なら一次に揃える。 */
+function loadApiUrlOnBoot(){
+  let primary = '';
+  try{ primary = localStorage.getItem(API_KEY) || ''; }catch(e){}
+  const secondary = (typeof DB === 'object' && DB && typeof DB.apiUrl === 'string') ? DB.apiUrl : '';
+  // 両方空なら何もしない
+  if(!primary && !secondary) return '';
+  // 一次優先：両方非空で値違いの場合は一次に従って二次を更新
+  const winner = primary || secondary;
+  // 失われていた側を補填して整合化
+  if(winner && (primary !== winner || secondary !== winner)){
+    saveApiUrl(winner);
+    if(!primary && secondary){
+      // 一次が消えていた → ITP 等による消失。コンソールに記録。
+      console.info('apiUrl recovered from DB.apiUrl backup');
+    }
+  }
+  return winner;
+}
+
+let apiUrl = '';  // wireSync IIFE / loadApiUrlOnBoot 経由で初期化（DB ロード後）
 
 function apiSetStatus(st, msg){
   const b = document.getElementById('apiBd');
@@ -1368,6 +1482,9 @@ async function syncFromAPI(showLoader){
     }
 
     apiSetStatus('ok', '最終同期: '+ new Date().toLocaleTimeString('ja-JP'));
+    // ITP対策：成功した同期のたびに URL を再書き込みしてストレージのアクセス時刻を
+    // 更新する（Safari は7日間アクセスが無いと個別キーを消す可能性あり）。
+    if(apiUrl) saveApiUrl(apiUrl);
     // redraw everything that might be showing stale data
     try{
       if(typeof renderList === 'function')  renderList();
@@ -3555,7 +3672,8 @@ function openResident(id){
   $('#mdName').value = r?.name || '';
   $('#mdRoom').value = r?.room || '';
   $('#mdSex').value = r?.sex || '';
-  $('#mdBirth').value = r?.birthDate || '';
+  // 生年月日：トリオ + 元号入力に分解してセット
+  birthSetFromIso(r?.birthDate || '');
   $('#mdAdmit').value = r?.admitDate || '';
   $('#mdHeight').value = r?.heightCm ?? '';
   $('#mdChair').value = r?.wheelchairKg ?? '';
@@ -3566,6 +3684,156 @@ function openResident(id){
   $('#mdResident').classList.add('on');
   setTimeout(()=> $('#mdName').focus(), 50);
 }
+
+/* =============================================================
+   生年月日：3分割（年/月/日）+ 和暦ヘルパー
+   ------------------------------------------------------------
+   - <input type="date"> は90年分スクロールが必要で老人ホーム業務に不向き。
+   - そこで Y/M/D の3つの数値テキスト入力に直接タイピングする方式に変更。
+   - 入力完了で自動的に次のフィールドへフォーカス、有効な日付になり次第
+     hidden の #mdBirth を ISO（YYYY-MM-DD）で更新するため、保存パスは無改修。
+   - 4元号（大正/昭和/平成/令和）ボタンを押すと元号年→西暦年へ自動変換できる。
+   ============================================================= */
+const ERA_BASE = { T: 1911, S: 1925, H: 1988, R: 2018 };  // T1=1912, S1=1926, ...
+
+function pad2(n){ return String(n).padStart(2, '0'); }
+
+/* ローカルタイム基準で「日数として有効」かどうかを判定 */
+function isValidYMD(y, m, d){
+  if(!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return false;
+  if(y < 1900 || y > 2100) return false;
+  if(m < 1 || m > 12) return false;
+  if(d < 1 || d > 31) return false;
+  // ローカルタイムで Date を作って roundtrip 検査（無効な日 = 翌月へ繰り越されるはず）
+  const dt = new Date(y, m-1, d);
+  return dt.getFullYear()===y && dt.getMonth()===m-1 && dt.getDate()===d;
+}
+
+function calcAgeFromYMD(y, m, d){
+  if(!isValidYMD(y, m, d)) return null;
+  const today = new Date();
+  let age = today.getFullYear() - y;
+  if(today.getMonth()+1 < m || (today.getMonth()+1 === m && today.getDate() < d)) age--;
+  return age >= 0 && age <= 150 ? age : null;
+}
+
+/* hidden #mdBirth に書き込み、年齢表示を更新、エラー表示を制御。
+   いずれかが空欄なら hidden は空にしてプレース保留扱い（「未設定」）。 */
+function birthSyncFromTrio(){
+  const yEl = $('#mdBirthY'), mEl = $('#mdBirthM'), dEl = $('#mdBirthD');
+  const ageEl = $('#mdBirthAge'), hidden = $('#mdBirth');
+  if(!yEl || !mEl || !dEl || !hidden) return;
+  const y = yEl.value.trim() === '' ? null : Number(yEl.value);
+  const m = mEl.value.trim() === '' ? null : Number(mEl.value);
+  const d = dEl.value.trim() === '' ? null : Number(dEl.value);
+  yEl.classList.remove('bd-err'); mEl.classList.remove('bd-err'); dEl.classList.remove('bd-err');
+  // 全空 = 未設定（正常）
+  if(y===null && m===null && d===null){
+    hidden.value = '';
+    if(ageEl) ageEl.textContent = '';
+    return;
+  }
+  // 一部だけ入力 = 入力途中、年齢非表示
+  if(y===null || m===null || d===null){
+    hidden.value = '';
+    if(ageEl) ageEl.textContent = '';
+    return;
+  }
+  if(!isValidYMD(y, m, d)){
+    // どこが不正か粗くマーキング
+    if(!Number.isInteger(y) || y < 1900 || y > 2100) yEl.classList.add('bd-err');
+    if(!Number.isInteger(m) || m < 1 || m > 12)     mEl.classList.add('bd-err');
+    if(!Number.isInteger(d) || d < 1 || d > 31)     dEl.classList.add('bd-err');
+    // 月日が範囲内でも組み合わせ無効（例: 2/30）の場合は日をマーク
+    if(Number.isInteger(y) && Number.isInteger(m) && Number.isInteger(d) &&
+       m>=1 && m<=12 && d>=1 && d<=31) dEl.classList.add('bd-err');
+    hidden.value = '';
+    if(ageEl) ageEl.textContent = '';
+    return;
+  }
+  hidden.value = `${y}-${pad2(m)}-${pad2(d)}`;
+  const age = calcAgeFromYMD(y, m, d);
+  if(ageEl) ageEl.textContent = (age!=null) ? `${age}歳` : '';
+}
+
+/* 既存 ISO 日付を トリオに展開（編集モードなどで使用） */
+function birthSetFromIso(iso){
+  const yEl = $('#mdBirthY'), mEl = $('#mdBirthM'), dEl = $('#mdBirthD');
+  const eraYEl = $('#mdBirthEraY'), eraHint = $('#mdBirthEraHint');
+  const hidden = $('#mdBirth');
+  if(!yEl || !mEl || !dEl || !hidden) return;
+  // エラー状態と元号選択をリセット
+  $$('.bd-era-b').forEach(b=> b.classList.remove('on'));
+  if(eraYEl){ eraYEl.value = ''; eraYEl.disabled = true; }
+  if(eraHint) eraHint.textContent = '年号を選んで元号年を入力';
+  yEl.classList.remove('bd-err'); mEl.classList.remove('bd-err'); dEl.classList.remove('bd-err');
+  if(!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)){
+    yEl.value = ''; mEl.value = ''; dEl.value = '';
+    hidden.value = '';
+    const ageEl = $('#mdBirthAge'); if(ageEl) ageEl.textContent = '';
+    return;
+  }
+  const [ys, ms, ds] = iso.split('-');
+  yEl.value = String(Number(ys));   // 先頭ゼロ除去（4桁年なので影響なし）
+  mEl.value = String(Number(ms));
+  dEl.value = String(Number(ds));
+  birthSyncFromTrio();
+}
+
+/* トリオ入力のワイヤリング（モジュール初期化時に1度だけ実行） */
+(function wireBirthTrio(){
+  const yEl = $('#mdBirthY'), mEl = $('#mdBirthM'), dEl = $('#mdBirthD');
+  const eraYEl = $('#mdBirthEraY'), eraHint = $('#mdBirthEraHint');
+  if(!yEl || !mEl || !dEl) return;
+
+  // 入力可能文字を数字のみに制限し、上限長到達で自動的に次のフィールドへ移る
+  function bindNumeric(el, maxLen, nextEl){
+    el.addEventListener('input', ()=>{
+      const cleaned = el.value.replace(/\D/g, '').slice(0, maxLen);
+      if(cleaned !== el.value) el.value = cleaned;
+      birthSyncFromTrio();
+      if(nextEl && cleaned.length >= maxLen) nextEl.focus();
+    });
+    el.addEventListener('blur', birthSyncFromTrio);
+  }
+  bindNumeric(yEl, 4, mEl);
+  bindNumeric(mEl, 2, dEl);
+  bindNumeric(dEl, 2, null);
+
+  // 元号ボタン：押下で年号入力欄を有効化、再押下で解除
+  $$('.bd-era-b').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const era = btn.dataset.era;
+      const wasOn = btn.classList.contains('on');
+      $$('.bd-era-b').forEach(b=> b.classList.remove('on'));
+      if(wasOn){
+        if(eraYEl){ eraYEl.disabled = true; eraYEl.value = ''; }
+        if(eraHint) eraHint.textContent = '年号を選んで元号年を入力';
+        return;
+      }
+      btn.classList.add('on');
+      if(eraYEl){ eraYEl.disabled = false; eraYEl.value = ''; eraYEl.focus(); }
+      if(eraHint) eraHint.textContent = `${btn.textContent}〇年 を入力 → 西暦に変換`;
+    });
+  });
+
+  // 元号年入力 → 西暦に変換して年フィールドに反映
+  if(eraYEl){
+    eraYEl.addEventListener('input', ()=>{
+      const cleaned = eraYEl.value.replace(/\D/g, '').slice(0, 2);
+      if(cleaned !== eraYEl.value) eraYEl.value = cleaned;
+      const onBtn = $$('.bd-era-b').find(b=> b.classList.contains('on'));
+      if(!onBtn || !cleaned) return;
+      const era = onBtn.dataset.era;
+      const n = Number(cleaned);
+      if(!Number.isInteger(n) || n < 1) return;
+      const seireki = ERA_BASE[era] + n;
+      yEl.value = String(seireki);
+      birthSyncFromTrio();
+      if(eraHint) eraHint.textContent = `${onBtn.textContent}${n}年 = 西暦${seireki}年`;
+    });
+  }
+})();
 
 $('#mdSave').addEventListener('click', ()=>{
   const name = $('#mdName').value.trim();
@@ -3641,7 +3909,24 @@ $('#cfgFile').addEventListener('change', async e=>{
     const d = JSON.parse(text);
     if(!d.residents || !d.records) throw new Error('bad file');
     if(!confirm(`現在のデータを置き換えます（入居者${d.residents.length}名 / 記録${d.records.length}件）。続行しますか？`)) return;
-    DB = d; save(); renderCfg(); updateAlertBadge();
+    // 現在の GAS 連携URLは原則として保持。インポートファイル側にも URL があれば
+    // 「自分の URL を保つ／ファイル側に従う」をユーザに選ばせる。
+    const currentUrl = apiUrl || (DB && DB.apiUrl) || '';
+    const fileUrl = (d && typeof d.apiUrl === 'string') ? d.apiUrl : '';
+    DB = d;
+    let finalUrl = currentUrl;
+    if(fileUrl && fileUrl !== currentUrl){
+      finalUrl = confirm(
+        `インポートファイルにも GAS 連携URLが含まれています。\n\n` +
+        `現在: ${currentUrl ? '…'+currentUrl.slice(-40) : '（未設定）'}\n` +
+        `ファイル: …${fileUrl.slice(-40)}\n\n` +
+        `OK = ファイル側のURLに切り替える / キャンセル = 現在のURLを維持`
+      ) ? fileUrl : currentUrl;
+    }
+    DB.apiUrl = finalUrl;
+    save();
+    if(finalUrl) saveApiUrl(finalUrl);  // 一次LSにも反映
+    renderCfg(); updateAlertBadge();
     populateResidentSelect($('#inResident'), {preferId: UI.inRes});
     populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true});
     toast('インポートしました');
@@ -3687,12 +3972,16 @@ $('#cfgCsv').addEventListener('click', ()=>{
 });
 $('#cfgClear').addEventListener('click', ()=>{
   if(!confirm('全データを削除します。本当によろしいですか？（元に戻せません）')) return;
-  DB = structuredClone(DEFAULT_DB); save();
+  // GAS連携URLは「アプリ設定」なので、データ削除では保持する
+  const keepUrl = (DB && DB.apiUrl) || apiUrl || '';
+  DB = structuredClone(DEFAULT_DB);
+  if(keepUrl) DB.apiUrl = keepUrl;
+  save();
   saveUI({inRes:'', ivRes:''});
   renderCfg(); updateAlertBadge();
   populateResidentSelect($('#inResident'));
   populateResidentSelect($('#ivResident'));
-  toast('全データを削除しました');
+  toast('全データを削除しました' + (keepUrl ? '（GAS連携URLは保持）' : ''));
 });
 
 /* sample data */
@@ -3764,10 +4053,12 @@ $('#cfgSample').addEventListener('click', ()=>{
    Cloud sync wiring (settings UI + auto-pull on startup)
    ============================================================ */
 (function wireSync(){
+  // 起動時：localStorage / DB.apiUrl のいずれかから URL を復元し、両方に揃える
+  apiUrl = loadApiUrlOnBoot();
   const cfgApi = $('#cfgApi');
   if(cfgApi) cfgApi.value = apiUrl || '';
   if(apiUrl){
-    apiSetStatus('ok', '接続URL: ' + apiUrl.slice(0, 60) + (apiUrl.length>60?'...':''));
+    apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + apiUrl.slice(-40));
     // initial pull — non-blocking
     setTimeout(()=> syncFromAPI(true), 100);
   }
@@ -3793,13 +4084,23 @@ $('#cfgSample').addEventListener('click', ()=>{
     if(!url.startsWith('https://script.google.com/')){
       toast('GAS Web App のURL (https://script.google.com/〜) を確認してください','err'); return;
     }
-    apiUrl = url;
-    localStorage.setItem(API_KEY, url);
+    // 二箇所（LS + DB）に保存し、setItem の成功を読み戻して検証
+    const sv = saveApiUrl(url);
+    if(!sv.ok){
+      toast('⚠️ URLの保存に失敗しました（プライベートブラウズ等）。設定を確認してください','err');
+      apiSetStatus('er', 'URLの保存に失敗（LS×・DB×）');
+      return;
+    }
+    if(!sv.lsOk){
+      // 一次は失敗したが二次は成功（次回起動時に自動復元される）
+      toast('⚠️ 一次保存に失敗。バックアップ側のみで継続（再起動時に復元します）','err');
+    }
     apiSetStatus('sy','接続中...');
     hideDiagPanel();
     const ok = await syncFromAPI(true);
     if(ok){
-      toast('✅ サーバーに接続し同期しました','ok');
+      toast('✅ URL を保存し同期しました（…' + url.slice(-30) + '）','ok');
+      apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + url.slice(-40));
     } else {
       // 失敗時は自動で診断を実行して具体的な原因を表示
       toast('接続失敗。診断を実行します…','err');
@@ -3827,8 +4128,8 @@ $('#cfgSample').addEventListener('click', ()=>{
   });
   $('#btnApiClear')?.addEventListener('click', ()=>{
     if(!confirm('サーバー連携を解除します。ローカルデータは残ります。続行しますか？')) return;
-    apiUrl = '';
-    localStorage.removeItem(API_KEY);
+    // 一次・二次の両方からクリア
+    clearApiUrl();
     if($('#cfgApi')) $('#cfgApi').value = '';
     apiSetStatus('of');
     $('#apiStatus').textContent = 'GASをデプロイして取得したURLを入力して「URLを保存・接続」を押してください。';
