@@ -1175,6 +1175,10 @@ function load(){
     const d = JSON.parse(raw);
     if(!d.residents) d.residents = [];
     if(!d.records) d.records = [];
+    // Migration: 入居者の name/room を必ず文字列にする。GAS から返ってきた room
+    // は数値型のままになることが多く、これが原因で sortedResidents の
+    // localeCompare が例外を出していた（一覧・入力・個別・集計が空白に見える）。
+    for(const r of d.residents){ if(typeof normalizeResident === 'function') normalizeResident(r); }
     // Migration: records now require a unique `id`. Assign one to any legacy
     // record that lacks it so daily/weekly extra measurements can coexist
     // within the same yearMonth and be edited/deleted individually.
@@ -1199,6 +1203,18 @@ function load(){
 }
 function save(){ localStorage.setItem(LS_KEY, JSON.stringify(DB)); }
 let DB = load();
+/* 起動直後の自己修復：load() の中で型崩れを修正済みだが、それを localStorage
+   にも書き戻して恒久的にクリーンな状態にする。次回ロード以降、再変換コストが
+   かからず、別経路（CSV エクスポート等）でも一貫したデータが得られる。 */
+(function selfHealResidentsOnBoot(){
+  try{
+    const fixed = (typeof normalizeAllResidents === 'function') ? normalizeAllResidents() : 0;
+    if(fixed > 0){
+      save();
+      console.info(`selfHeal: normalized ${fixed} resident record(s) at boot`);
+    }
+  }catch(e){ console.warn('selfHeal failed:', e); }
+})();
 
 /* ============================================================
    Cloud sync (Google Sheets via GAS Web App)
@@ -1483,6 +1499,10 @@ async function syncFromAPI(showLoader){
     const apiRes = Array.isArray(json.residents) ? json.residents : [];
     const apiRec = Array.isArray(json.records)   ? json.records   : [];
     const apiThr = json.thresholds && typeof json.thresholds === 'object' ? json.thresholds : null;
+    // GAS は "206" のような部屋番号文字列を数値 206 に自動変換することがあり、
+    // それが原因で sortedResidents の localeCompare が例外を出して全画面の
+    // プルダウン・一覧・集計が空白になる。サーバから受け取った時点で正規化する。
+    apiRes.forEach(r => normalizeResident(r));
 
     // merge: server wins on ID collision, local-only IDs are preserved
     const mergeById = (serverList, localList)=>{
@@ -1668,10 +1688,50 @@ function isDischarged(r){
   return !!(r && typeof r.dischargedAt === 'string' && r.dischargedAt);
 }
 
+/* 安全な文字列化。GAS / CSV / JSON インポートなどの境界で room や name が
+   数値や null として届いても、内部処理は常に文字列として扱う。 */
+function _toSafeStr(v){
+  if(v == null) return '';
+  if(typeof v === 'string') return v;
+  if(typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return '';
+}
+
+/* 入居者オブジェクトを正規化（その場で書き換える）。
+   主に room（GAS が "206" を数値 206 として返す）と name の型崩れを修正する。
+   normalizeResident は load() / 同期マージ後 / JSONインポート 等の境界で呼ぶ。 */
+function normalizeResident(r){
+  if(!r || typeof r !== 'object') return r;
+  if(typeof r.name !== 'string') r.name = _toSafeStr(r.name);
+  if(typeof r.room !== 'string') r.room = _toSafeStr(r.room);
+  // dischargedAt は string か falsy のみ許容（数値・Date 等が混入しても無視）
+  if(r.dischargedAt != null && typeof r.dischargedAt !== 'string'){
+    // ISO YYYY-MM-DD への変換を試みる（GAS Date オブジェクトのケース等）
+    try{
+      const d = new Date(r.dischargedAt);
+      r.dischargedAt = isNaN(d.getTime()) ? '' : d.toISOString().slice(0,10);
+    }catch(e){ r.dischargedAt = ''; }
+  }
+  return r;
+}
+/* DB.residents 全件を正規化。何件補正したか返す。 */
+function normalizeAllResidents(){
+  const arr = Array.isArray(DB.residents) ? DB.residents : [];
+  let fixed = 0;
+  for(const r of arr){
+    if(!r || typeof r !== 'object') continue;
+    const beforeRoom = r.room, beforeName = r.name;
+    normalizeResident(r);
+    if(r.room !== beforeRoom || r.name !== beforeName) fixed++;
+  }
+  return fixed;
+}
+
 /* 入居者の並び順を返す。
    - opts.includeDischarged: 退去者も含める（既定 false）
    - 退去者は常に末尾に並ぶ（活動中→退去者の順）
-   既存の name/room ロジックは維持。 */
+   サーバから来たデータで room/name が数値型のままになっていても例外を出さず、
+   この場で文字列化して比較する（_toSafeStr）。 */
 function sortedResidents(opts){
   const include = !!(opts && opts.includeDischarged);
   const list = (DB.residents || []).filter(r =>
@@ -1681,9 +1741,11 @@ function sortedResidents(opts){
     const ad = isDischarged(a) ? 1 : 0;
     const bd = isDischarged(b) ? 1 : 0;
     if(ad !== bd) return ad - bd;  // 活動中を先、退去者を後ろに
-    const roomCmp = (a.room||'').localeCompare(b.room||'', 'ja', {numeric:true});
+    const ar = _toSafeStr(a.room), br = _toSafeStr(b.room);
+    const an = _toSafeStr(a.name), bn = _toSafeStr(b.name);
+    const roomCmp = ar.localeCompare(br, 'ja', { numeric: true });
     if(roomCmp !== 0) return roomCmp;
-    return (a.name||'').localeCompare(b.name||'', 'ja');
+    return an.localeCompare(bn, 'ja');
   });
 }
 function populateResidentSelect(sel, opts={}){
@@ -4012,15 +4074,20 @@ $('#mdSave').addEventListener('click', ()=>{
     DB.residents.push(savedResident);
     toast('入居者を追加しました');
   }
+  // 保存直前に必ず正規化（room/name 等の型崩れを抑止）
+  normalizeResident(savedResident);
   save();
   apiPush('saveResident', { resident: savedResident });
   $('#mdResident').classList.remove('on');
+  // すべての画面を再描画：今 cfg にいてもユーザはすぐに他のタブに移るため、
+  // 一覧・集計・入居者選択プルダウンも併せて更新しておく。
   renderCfg();
+  if(typeof renderList === 'function') renderList();
+  if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
   populateResidentSelect($('#inResident'), {preferId: UI.inRes});
   populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
-  // refresh the read-only meal display in case the user edited the
-  // currently-selected resident from the input screen.
   if(typeof renderInputMealDisplay === 'function') renderInputMealDisplay();
+  if(typeof updateAlertBadge === 'function') updateAlertBadge();
 });
 
 /* 退去 / 復帰 ボタン
@@ -4082,8 +4149,11 @@ $('#mdDel').addEventListener('click', ()=>{
   for(const rid of relatedIds) apiPush('delRecord', { id: rid });
   $('#mdResident').classList.remove('on');
   renderCfg();
+  if(typeof renderList === 'function') renderList();
+  if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
   populateResidentSelect($('#inResident'), {preferId: UI.inRes});
   populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+  if(typeof updateAlertBadge === 'function') updateAlertBadge();
   toast('削除しました');
 });
 
@@ -4108,6 +4178,9 @@ $('#cfgFile').addEventListener('change', async e=>{
     const currentUrl = apiUrl || (DB && DB.apiUrl) || '';
     const fileUrl = (d && typeof d.apiUrl === 'string') ? d.apiUrl : '';
     DB = d;
+    // インポート直後に入居者の name/room を文字列化（古いバックアップ or
+    // GAS 由来のJSONで型崩れがある可能性に備える）
+    if(Array.isArray(DB.residents)) DB.residents.forEach(r => normalizeResident(r));
     let finalUrl = currentUrl;
     if(fileUrl && fileUrl !== currentUrl){
       finalUrl = confirm(
