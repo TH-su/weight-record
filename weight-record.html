@@ -518,6 +518,16 @@ textarea{resize:vertical;min-height:60px}
 /* dropdown の退去者表記 */
 select option.is-discharged{color:var(--g6)}
 
+/* ストレージ診断パネル */
+.storage-diag{margin-top:12px;padding:10px 12px;background:var(--g0);border:1px solid var(--g2);
+  border-radius:8px;font-size:11px;line-height:1.55}
+.storage-diag .sd-row{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.storage-diag .sd-l{color:var(--g6);min-width:96px}
+.storage-diag .sd-v{color:var(--g9);font-weight:700;font-variant-numeric:tabular-nums}
+.storage-diag .sd-v.warn{color:var(--ng)}
+.storage-diag .sd-v.ok{color:var(--ok)}
+.storage-diag .sd-actions{margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+
 /* loading overlay */
 .ld-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:600;
   align-items:center;justify-content:center;flex-direction:column;gap:10px;cursor:pointer}
@@ -778,7 +788,7 @@ select option.is-discharged{color:var(--g6)}
       <table class="ht" id="ivHist">
         <thead>
           <tr>
-            <th style="text-align:left;padding-left:10px">測定日</th>
+            <th style="text-align:left;padding-left:10px">入力日</th>
             <th>体重(kg)</th>
             <th>BMI</th>
             <th>前月比</th>
@@ -933,6 +943,17 @@ select option.is-discharged{color:var(--g6)}
       <button class="bn br" id="cfgClear">全データ削除</button>
     </div>
     <input type="file" id="cfgFile" accept="application/json" style="display:none">
+    <!-- ストレージ診断（保存状態を可視化） -->
+    <div class="storage-diag" id="storageDiag">
+      <div class="sd-row"><span class="sd-l">最終保存：</span><span class="sd-v" id="sdLastSave">—</span></div>
+      <div class="sd-row"><span class="sd-l">保存件数：</span><span class="sd-v" id="sdCounts">—</span></div>
+      <div class="sd-row"><span class="sd-l">バックアップ：</span><span class="sd-v" id="sdBackup">—</span></div>
+      <div class="sd-row"><span class="sd-l">使用容量：</span><span class="sd-v" id="sdUsage">—</span></div>
+      <div class="sd-actions">
+        <button class="bn bs bsm" id="sdRefresh">🔄 状態を更新</button>
+        <button class="bn bo bsm" id="sdRecover">🩹 バックアップから復元</button>
+      </div>
+    </div>
   </div>
 
   <!-- Google Sheets (GAS Web App) 連携 -->
@@ -1102,6 +1123,9 @@ select option.is-discharged{color:var(--g6)}
    Data layer
    ============================================================ */
 const LS_KEY = 'wtmgr_v1';
+const LS_BAK = 'wtmgr_v1_bak';      // 直前の正常な状態（一世代）
+const LS_BAK2 = 'wtmgr_v1_bak2';    // さらに一世代前（二世代）
+const LS_LAST_SAVE = 'wtmgr_last_save_at';  // 最終保存時刻（人にも分かるよう ISO で）
 const LS_UI  = 'wtmgr_ui_v1';
 const LS_THR = 'wtmgr_thr_v1';
 
@@ -1168,11 +1192,52 @@ function bmiCat(bmi){
 
 const DEFAULT_DB = { residents:[], records:[] };
 
+/* localStorage から JSON を安全に取り出す。パース失敗・型不正は null を返す。
+   サニティ：residents / records 配列のどちらか一方でも持つオブジェクト。 */
+function _readDbFromKey(key){
+  try{
+    const raw = localStorage.getItem(key);
+    if(!raw) return null;
+    const d = JSON.parse(raw);
+    if(!d || typeof d !== 'object') return null;
+    // 配列が一つも無ければ未初期化なので null
+    if(!Array.isArray(d.residents) && !Array.isArray(d.records)) return null;
+    return d;
+  }catch(e){
+    console.warn('_readDbFromKey('+key+') failed:', e.message);
+    return null;
+  }
+}
+
 function load(){
   try{
-    const raw = localStorage.getItem(LS_KEY);
-    if(!raw) return structuredClone(DEFAULT_DB);
-    const d = JSON.parse(raw);
+    // 1) 一次キーから読み出し試行
+    let d = _readDbFromKey(LS_KEY);
+    let recoveredFrom = null;
+    // 2) 一次が壊れていたらバックアップから復旧
+    if(!d){
+      d = _readDbFromKey(LS_BAK);
+      if(d){ recoveredFrom = LS_BAK; }
+    }
+    // 3) 二世代前のバックアップも試す
+    if(!d){
+      d = _readDbFromKey(LS_BAK2);
+      if(d){ recoveredFrom = LS_BAK2; }
+    }
+    // 4) すべて駄目なら空 DB（初回起動 or 完全消失）
+    if(!d){
+      const hadAnyKey = !!localStorage.getItem(LS_KEY) || !!localStorage.getItem(LS_BAK) || !!localStorage.getItem(LS_BAK2);
+      if(hadAnyKey){
+        // 何かはあったが全部壊れていた → ユーザに警告できるよう残しておく
+        console.error('load: all DB keys were unreadable; starting empty');
+        try{ sessionStorage.setItem('wtmgr_load_error', '1'); }catch(e){}
+      }
+      return structuredClone(DEFAULT_DB);
+    }
+    if(recoveredFrom){
+      console.warn('load: recovered DB from '+recoveredFrom);
+      try{ sessionStorage.setItem('wtmgr_recovered_from', recoveredFrom); }catch(e){}
+    }
     if(!d.residents) d.residents = [];
     if(!d.records) d.records = [];
     // Migration: 入居者の name/room を必ず文字列にする。GAS から返ってきた room
@@ -1185,6 +1250,10 @@ function load(){
     for(const r of d.records){
       if(!r.id) r.id = 'r'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
     }
+    // Migration: 体重記録の yearMonth/measuredOn が GAS 経由で ISO タイムスタンプに
+    // 化けるケース（例: "2026-04-14T15:00:00.000Z"）を YYYY-MM / YYYY-MM-DD に正規化。
+    // これにより一覧・集計が getRecord(rid, "2026-04") で正しくヒットする。
+    for(const r of d.records){ if(typeof normalizeRecord === 'function') normalizeRecord(r); }
     // Migration: 食事形態を resident のマスタへ昇格。既に設定済みのものは触らず、
     // 未設定の入居者については最新 record の食事スナップショットでバックフィル。
     // これにより食事形態の編集が設定画面に集約された後も、既存ユーザの値は保たれる。
@@ -1201,20 +1270,110 @@ function load(){
     return d;
   }catch(e){ console.error(e); return structuredClone(DEFAULT_DB); }
 }
-function save(){ localStorage.setItem(LS_KEY, JSON.stringify(DB)); }
+/* 永続化：try/catch + 読み戻し検証 + 二世代バックアップローテーション
+   ----------------------------------------------------------------
+   旧実装は setItem 一発で、quota 超過・プライベートモード・部分書込み等で
+   黙って失敗 → 次回 load() で JSON 破損 → DEFAULT_DB（空）が返り全データ
+   消失、という最悪の経路があった。これを以下で潰す：
+     1. シリアライズが成功するか先に検証
+     2. 旧 LS_KEY を LS_BAK へ、旧 LS_BAK を LS_BAK2 へローテーション
+        （新規書込みが失敗・部分書込みでも、直前世代が無事なので復旧可）
+     3. setItem を try/catch で包み、書込み後に getItem で文字列一致を検証
+     4. 最終保存時刻を LS_LAST_SAVE に記録（UI で「保存済み HH:MM」表示）
+     5. 失敗時は false を返し、呼び出し元でユーザに通知できるようにする
+   呼び出し元は基本的に save() を fire-and-forget で使うが、致命的失敗を
+   検知したい場合は戻り値（boolean）を見ること。 */
+let _lastSaveOk = true;
+let _lastSaveAt = null;
+function save(){
+  let json;
+  try{ json = JSON.stringify(DB); }
+  catch(e){
+    console.error('save: serialize failed:', e);
+    _lastSaveOk = false;
+    if(typeof toast === 'function') toast('⚠️ データ保存失敗（シリアライズ）','err');
+    return false;
+  }
+  // 念のため、生成した JSON 自体が再パース可能か検証
+  try{ JSON.parse(json); }
+  catch(e){
+    console.error('save: JSON re-parse failed:', e);
+    _lastSaveOk = false;
+    if(typeof toast === 'function') toast('⚠️ データ保存失敗（JSON 不正）','err');
+    return false;
+  }
+  // ローテーション：書込み前に「現在の良好なスナップショット」を二世代まで残す
+  try{
+    const cur = localStorage.getItem(LS_KEY);
+    if(cur && cur.length > 30){       // 微小な値（例: '{}'）はバックアップしない
+      const prevBak = localStorage.getItem(LS_BAK);
+      if(prevBak && prevBak !== cur){
+        try{ localStorage.setItem(LS_BAK2, prevBak); }catch(e){ /* 二世代目は best-effort */ }
+      }
+      try{ localStorage.setItem(LS_BAK, cur); }catch(e){ /* バックアップ失敗は続行 */ }
+    }
+  }catch(e){ /* 履歴側のエラーで本体保存を阻害しない */ }
+  // 本体書込み + 検証
+  try{
+    localStorage.setItem(LS_KEY, json);
+    const verify = localStorage.getItem(LS_KEY);
+    if(verify !== json){
+      console.error('save: verification mismatch (truncation or quota?)');
+      _lastSaveOk = false;
+      if(typeof toast === 'function') toast('⚠️ データ保存後の検証失敗（ストレージ不足の可能性）','err');
+      return false;
+    }
+  }catch(e){
+    // 多くの場合 QuotaExceededError か SecurityError（プライベートモード）
+    console.error('save: setItem failed:', e);
+    _lastSaveOk = false;
+    if(typeof toast === 'function'){
+      const msg = (e && e.name === 'QuotaExceededError')
+        ? '⚠️ ストレージ容量不足。古いデータの整理をお勧めします'
+        : '⚠️ データ保存に失敗しました（' + (e.message || e.name || 'unknown') + '）';
+      toast(msg, 'err');
+    }
+    return false;
+  }
+  _lastSaveOk = true;
+  _lastSaveAt = new Date().toISOString();
+  try{ localStorage.setItem(LS_LAST_SAVE, _lastSaveAt); }catch(e){}
+  // 同時に開かれている他タブへ通知（複数タブで同じ DB を見ている場合の検出に使える）
+  try{ window.dispatchEvent(new CustomEvent('wtmgr-saved', { detail:{ at:_lastSaveAt } })); }catch(e){}
+  return true;
+}
 let DB = load();
 /* 起動直後の自己修復：load() の中で型崩れを修正済みだが、それを localStorage
    にも書き戻して恒久的にクリーンな状態にする。次回ロード以降、再変換コストが
    かからず、別経路（CSV エクスポート等）でも一貫したデータが得られる。 */
-(function selfHealResidentsOnBoot(){
+(function selfHealOnBoot(){
   try{
-    const fixed = (typeof normalizeAllResidents === 'function') ? normalizeAllResidents() : 0;
-    if(fixed > 0){
+    const fixedR = (typeof normalizeAllResidents === 'function') ? normalizeAllResidents() : 0;
+    const fixedRec = (typeof normalizeAllRecords === 'function') ? normalizeAllRecords() : 0;
+    if(fixedR > 0 || fixedRec > 0){
       save();
-      console.info(`selfHeal: normalized ${fixed} resident record(s) at boot`);
+      console.info(`selfHeal: normalized ${fixedR} resident(s), ${fixedRec} record(s) at boot`);
     }
   }catch(e){ console.warn('selfHeal failed:', e); }
 })();
+/* 起動時：load() がバックアップから復元した／全キー読めなかった場合、
+   ユーザに知らせる。toast はまだ DOM 準備前かもしれないので setTimeout で。 */
+setTimeout(()=>{
+  try{
+    const recoveredFrom = sessionStorage.getItem('wtmgr_recovered_from');
+    const loadError     = sessionStorage.getItem('wtmgr_load_error');
+    if(recoveredFrom){
+      sessionStorage.removeItem('wtmgr_recovered_from');
+      if(typeof toast === 'function')
+        toast(`⚠️ 主データが破損していたためバックアップ（${recoveredFrom==='wtmgr_v1_bak'?'1世代前':'2世代前'}）から復旧しました`, 'err');
+    }
+    if(loadError){
+      sessionStorage.removeItem('wtmgr_load_error');
+      if(typeof toast === 'function')
+        toast('⚠️ 保存データが読めず空の状態で起動しました。GAS連携があれば「手動同期」をお試しください', 'err');
+    }
+  }catch(e){}
+}, 800);
 
 /* ============================================================
    Cloud sync (Google Sheets via GAS Web App)
@@ -1503,6 +1662,10 @@ async function syncFromAPI(showLoader){
     // それが原因で sortedResidents の localeCompare が例外を出して全画面の
     // プルダウン・一覧・集計が空白になる。サーバから受け取った時点で正規化する。
     apiRes.forEach(r => normalizeResident(r));
+    // 体重記録も同様に GAS が "2026-04" を Date 型に勝手に解釈し、応答時に
+    // ISO タイムスタンプ文字列で返す → 月単位のキー比較がすべて外れる。受信時に
+    // 'YYYY-MM' / 'YYYY-MM-DD' に揃えることで一覧・集計の月セルが正しく埋まる。
+    apiRec.forEach(r => normalizeRecord(r));
 
     // merge: server wins on ID collision, local-only IDs are preserved
     const mergeById = (serverList, localList)=>{
@@ -1727,6 +1890,103 @@ function normalizeAllResidents(){
   return fixed;
 }
 
+/* 体重記録（record）の正規化。
+   GAS/Google Sheets は "2026-04" や "2026-04-15" の文字列を Date として認識し、
+   返却時に "2026-04-14T15:00:00.000Z" のような ISO タイムスタンプに化けることが
+   多発する。これが原因で getRecord(rid, "2026-04") が一致せず、一覧・集計が
+   空になる。あらゆる入口でこの場で文字列フォーマットに揃える。 */
+function _toYearMonth(v){
+  // 期待形式: 'YYYY-MM'。失敗時は ''
+  if(v == null) return '';
+  if(typeof v === 'string'){
+    if(/^\d{4}-\d{2}$/.test(v)) return v;                  // 既に正規形
+    if(/^\d{4}-\d{2}-\d{2}$/.test(v)) return v.slice(0,7); // 純粋な日付形式
+    // ISO タイムスタンプは **ローカルタイム** に変換して取り出す。GAS が JST の
+    // タイムゾーンで「2026-03」を Date 化すると "2026-02-28T15:00:00Z"（JST 3/1 00:00）
+    // となるため、ローカル解釈で 2026-03 に戻る。日付のみの slice では誤った
+    // 「2026-02」を返してしまうので避ける。
+    if(/^\d{4}-\d{2}-\d{2}T/.test(v)){
+      const d = new Date(v);
+      if(!isNaN(d.getTime())){
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+      }
+    }
+  }
+  if(v instanceof Date && !isNaN(v.getTime())){
+    return v.getFullYear() + '-' + String(v.getMonth()+1).padStart(2,'0');
+  }
+  try{
+    const d = new Date(v);
+    if(!isNaN(d.getTime())) return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+  }catch(e){}
+  return '';
+}
+function _toIsoDate(v){
+  // 期待形式: 'YYYY-MM-DD'。失敗時は null（未設定扱い）
+  if(v == null || v === '') return null;
+  if(typeof v === 'string'){
+    if(/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+    if(/^\d{4}-\d{2}-\d{2}T/.test(v)){
+      const d = new Date(v);
+      if(!isNaN(d.getTime())){
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+      }
+    }
+  }
+  if(v instanceof Date && !isNaN(v.getTime())){
+    return v.getFullYear() + '-' + String(v.getMonth()+1).padStart(2,'0') + '-' + String(v.getDate()).padStart(2,'0');
+  }
+  try{
+    const d = new Date(v);
+    if(!isNaN(d.getTime())) return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+  }catch(e){}
+  return null;
+}
+function normalizeRecord(rec){
+  if(!rec || typeof rec !== 'object') return rec;
+  // yearMonth は 'YYYY-MM' 必須
+  const ym = _toYearMonth(rec.yearMonth);
+  if(ym) rec.yearMonth = ym;
+  // measuredOn は 'YYYY-MM-DD' 形式 / null / 未設定のいずれか
+  if('measuredOn' in rec){
+    const md = _toIsoDate(rec.measuredOn);
+    rec.measuredOn = md;  // null になり得る
+  }
+  // weight は数値
+  if(rec.weight != null && typeof rec.weight !== 'number'){
+    const w = Number(rec.weight);
+    rec.weight = isNaN(w) ? 0 : w;
+  }
+  // wheelchairKg / rawWeight も数値
+  if(rec.wheelchairKg != null && typeof rec.wheelchairKg !== 'number'){
+    const v = Number(rec.wheelchairKg);
+    rec.wheelchairKg = isNaN(v) ? null : v;
+  }
+  if(rec.rawWeight != null && typeof rec.rawWeight !== 'number'){
+    const v = Number(rec.rawWeight);
+    rec.rawWeight = isNaN(v) ? null : v;
+  }
+  // stapleAmount も数値
+  if(rec.stapleAmount != null && typeof rec.stapleAmount !== 'number'){
+    const v = Number(rec.stapleAmount);
+    rec.stapleAmount = isNaN(v) ? null : v;
+  }
+  return rec;
+}
+/* DB.records 全件を正規化。何件補正したか返す。 */
+function normalizeAllRecords(){
+  const arr = Array.isArray(DB.records) ? DB.records : [];
+  let fixed = 0;
+  for(const r of arr){
+    if(!r || typeof r !== 'object') continue;
+    const before = JSON.stringify({ym:r.yearMonth, mo:r.measuredOn, w:r.weight});
+    normalizeRecord(r);
+    const after  = JSON.stringify({ym:r.yearMonth, mo:r.measuredOn, w:r.weight});
+    if(before !== after) fixed++;
+  }
+  return fixed;
+}
+
 /* 入居者の並び順を返す。
    - opts.includeDischarged: 退去者も含める（既定 false）
    - 退去者は常に末尾に並ぶ（活動中→退去者の順）
@@ -1772,10 +2032,11 @@ function populateResidentSelect(sel, opts={}){
 /* ============================================================
    Alert engine
    ============================================================ */
-/* direction of the alert: 'dn' if the most relevant recent diff is negative, else 'up'.
-   Prefer the shortest-period diff available (前月比 → 3ヶ月比 → 6ヶ月比). */
+/* alert の方向：エントリ単位で _entryDir が指定されていれば優先。
+   無ければ過去互換として最も短い期間の差分の符号で判定。 */
 function alertDir(a){
-  const d = (a.diff1 ?? a.diff3 ?? a.diff6 ?? 0);
+  if(a && (a._entryDir === 'up' || a._entryDir === 'dn')) return a._entryDir;
+  const d = (a?.diff1 ?? a?.diff3 ?? a?.diff6 ?? 0);
   return d < 0 ? 'dn' : 'up';
 }
 // returns {level:'none'|'w'|'ng', diff1, pct1, diff3, pct3, diff6, pct6, reasons:[]}
@@ -2317,6 +2578,8 @@ function bulkSave(){
       };
       DB.records.push(rec);
     }
+    // 一括保存でも各レコードを正規化
+    normalizeRecord(rec);
     saved.push(rec);
   }
 
@@ -2807,6 +3070,17 @@ function syncInputFromExisting(){
   const rid = $('#inResident').value;
   const ym  = $('#inMonth').value;
   if(!rid || !ym){ updateEditBanner(); renderInputExistingList(); return; }
+  // 編集モード中（editingRecordId が立っている）に入居者・対象月を変えた場合は、
+  // フォームをクリアしない。clearInputForm すると editingRecordId が null になり、
+  // 保存時に「新規レコード作成」へ降格してしまい、元レコードが残ったまま重複が
+  // 発生する（ユーザの「編集前のデータが残ってしまう」報告の根本原因）。
+  // 編集中はそのレコードを編集対象として保持したまま、画面下の既存記録一覧と
+  // 編集バナーだけ更新する。
+  if(editingRecordId){
+    updateEditBanner();
+    renderInputExistingList();
+    return;
+  }
   // default: new-record form (does NOT auto-load any existing record).
   // The list of existing records is shown below so user can pick one to edit.
   clearInputForm();
@@ -2896,19 +3170,33 @@ $('#inSave').addEventListener('click', ()=>{
   }
 
   const mode = inMode;
-  const editing = editingRecordId ? getRecordById(editingRecordId) : null;
+  // 第一優先：明示的な編集モード（編集ボタンから入った状態）
+  let editing = editingRecordId ? getRecordById(editingRecordId) : null;
+  // 第二優先：編集モードでなくても、同じ入居者・同じ測定日のレコードが既にあれば
+  // それを上書き対象にする（ユーザがフォームを開き直して値を入れ直した時に、
+  // 古いレコードが「編集前のデータ」として残らないようにする自然キー方式）。
+  if(!editing && d){
+    const dup = (DB.records || []).find(x =>
+      x && x.residentId === rid && x.measuredOn === d
+    );
+    if(dup){
+      editing = dup;
+      editingRecordId = dup.id;  // 以降の処理で「編集中」として扱う
+    }
+  }
   let savedRec;
   if(editing){
     // weight / mode / date / note のみ更新。食事スナップショットは履歴として温存
     // （食事の変更は設定画面の入居者編集から行われ、新規記録の保存時に反映される）。
-    editing.yearMonth = ym;
-    editing.weight = Math.round(w*10)/10;
-    editing.measuredOn = d || null;
-    editing.measureMode = mode;
-    editing.rawWeight = raw!=null ? Math.round(raw*10)/10 : null;
+    editing.residentId   = rid;        // 念のため最新値で上書き
+    editing.yearMonth    = ym;
+    editing.weight       = Math.round(w*10)/10;
+    editing.measuredOn   = d || null;
+    editing.measureMode  = mode;
+    editing.rawWeight    = raw!=null ? Math.round(raw*10)/10 : null;
     editing.wheelchairKg = chair!=null ? Math.round(chair*10)/10 : null;
-    editing.note = $('#inNote').value.trim();
-    editing.updatedAt = new Date().toISOString();
+    editing.note         = $('#inNote').value.trim();
+    editing.updatedAt    = new Date().toISOString();
     savedRec = editing;
   }else{
     const rec = {
@@ -2928,6 +3216,8 @@ $('#inSave').addEventListener('click', ()=>{
     DB.records.push(rec);
     savedRec = rec;
   }
+  // 保存直前に必ず正規化（GAS 経由で型崩れしたものを上書き保存し直す場合にも安全）
+  normalizeRecord(savedRec);
   // update resident's registered wheelchair weight only when the value
   // actually changed from the prior chair record (an explicit change).
   let chairResUpdated = null;
@@ -2953,6 +3243,7 @@ $('#inSave').addEventListener('click', ()=>{
   updateAlertBadge();
   if(typeof renderList === 'function') renderList();
   if(typeof renderIndiv === 'function') renderIndiv();
+  if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
 });
 
 function deleteRecordById(id){
@@ -3363,9 +3654,27 @@ function drawHist(rid){
     const chairBadge = r.measureMode==='chair'
       ? `<span class="wc-badge" title="実測${r.rawWeight?.toFixed(1)}kg − 車椅子${r.wheelchairKg?.toFixed(1)}kg">車椅子</span>`
       : '';
-    const dateLabel = r.measuredOn
-      ? `<b>${r.measuredOn}</b><br><small style="color:var(--g6)">${ymFmt(r.yearMonth)}</small>`
-      : `<b>${ymFmt(r.yearMonth)}</b>`;
+    // 入力日（日時）：updatedAt があれば最終更新時刻、無ければ createdAt の日時を表示
+    // ローカルタイムで「YYYY/M/D HH:MM」に整形。タイムスタンプが無い古いデータは
+    // 測定日（YYYY-MM-DD）にフォールバック。
+    const _ts = r.updatedAt || r.createdAt;
+    let stampLabel = '';
+    if(_ts){
+      try{
+        const d = new Date(_ts);
+        if(!isNaN(d.getTime())){
+          const yy = d.getFullYear();
+          const mm = d.getMonth()+1;
+          const dd = d.getDate();
+          const hh = String(d.getHours()).padStart(2,'0');
+          const mi = String(d.getMinutes()).padStart(2,'0');
+          stampLabel = `${yy}/${mm}/${dd} ${hh}:${mi}`;
+        }
+      }catch(e){}
+    }
+    if(!stampLabel) stampLabel = r.measuredOn || ymFmt(r.yearMonth) || '';
+    const updatedTag = r.updatedAt ? ' <small style="color:var(--g5)">更新</small>' : '';
+    const dateLabel = `<b>${stampLabel}</b>${updatedTag}<br><small style="color:var(--g6)">対象月 ${ymFmt(r.yearMonth)}</small>`;
     tr.innerHTML = `
       <td style="text-align:left;padding-left:10px">${dateLabel}</td>
       <td><b>${r.weight.toFixed(1)}</b>${chairBadge?`<br>${chairBadge}`:''}</td>
@@ -3412,8 +3721,11 @@ $('#alFilter').addEventListener('click', e=>{
 });
 
 function collectAlerts(){
-  // pick most recent record per resident and analyze
-  // 退去者は対象外（既に施設にいないため、変動を通知する意味がない）
+  // 各入居者について最新月を analyze し、増加と減少を**別エントリ**として出力する。
+  // これにより：
+  //   - 「増加のみ」「減少のみ」フィルタが純粋に機能する（混在しない）
+  //   - 同一入居者で増加と減少が両期間で発生していれば 2 件表示される
+  //   - 各エントリの色は実際に閾値超過した期間の符号と一致する（赤＝増加・青＝減少）
   const out = [];
   for(const r of DB.residents){
     if(isDischarged(r)) continue;
@@ -3422,14 +3734,58 @@ function collectAlerts(){
     const last = recs[recs.length-1];
     const a = analyze(r.id, last.yearMonth);
     if(!a || a.level==='none') continue;
-    out.push({ resident:r, ym:last.yearMonth, a });
+
+    // 期間ごとに、実際に閾値を超えた行のみを取り出して 増加/減少 に振り分ける
+    const periods = [
+      { label:'前月比',  diff:a.diff1, pct:a.pct1, th:THR.m1 },
+      { label:'3ヶ月比', diff:a.diff3, pct:a.pct3, th:THR.m3 },
+      { label:'6ヶ月比', diff:a.diff6, pct:a.pct6, th:THR.m6 },
+    ];
+    const inc = { reasons:[], level:'none', maxAbsDiff:0, repDiff:0, repPct:0 };
+    const dec = { reasons:[], level:'none', maxAbsDiff:0, repDiff:0, repPct:0 };
+    const bumpLv = (cur, lv) => (cur === 'ng' || lv === 'ng') ? 'ng' : (cur === 'w' || lv === 'w') ? 'w' : 'none';
+    for(const p of periods){
+      if(p.diff == null) continue;
+      const absD = Math.abs(p.diff), absP = Math.abs(p.pct || 0);
+      const th = p.th || {};
+      const ngByKg  = th.ngKg > 0 && absD >= th.ngKg;
+      const ngByPct = th.ngPct > 0 && absP >= th.ngPct;
+      const wByKg   = th.wKg > 0  && absD >= th.wKg;
+      const wByPct  = th.wPct > 0 && absP >= th.wPct;
+      let lv = 'none';
+      if(ngByKg || ngByPct) lv = 'ng';
+      else if(wByKg || wByPct) lv = 'w';
+      if(lv === 'none') continue;
+      const sign = p.diff > 0 ? '増加' : (p.diff < 0 ? '減少' : '変化なし');
+      const mark = lv === 'ng' ? '【警告】' : '【注意】';
+      const text = `${mark}${p.label}で${absD.toFixed(1)}kg（${p.pct>0?'+':''}${(p.pct||0).toFixed(1)}%）${sign}`;
+      const tgt = (p.diff > 0) ? inc : (p.diff < 0 ? dec : null);
+      if(!tgt) continue;
+      tgt.reasons.push(text);
+      tgt.level = bumpLv(tgt.level, lv);
+      if(absD > tgt.maxAbsDiff){ tgt.maxAbsDiff = absD; tgt.repDiff = p.diff; tgt.repPct = p.pct || 0; }
+    }
+    // 増加エントリ
+    if(inc.reasons.length){
+      out.push({
+        resident: r, ym: last.yearMonth,
+        a: { ...a, reasons: inc.reasons, level: inc.level, _entryDir: 'up',
+             _diff: inc.repDiff, _pct: inc.repPct, _absDiff: inc.maxAbsDiff }
+      });
+    }
+    // 減少エントリ
+    if(dec.reasons.length){
+      out.push({
+        resident: r, ym: last.yearMonth,
+        a: { ...a, reasons: dec.reasons, level: dec.level, _entryDir: 'dn',
+             _diff: dec.repDiff, _pct: dec.repPct, _absDiff: dec.maxAbsDiff }
+      });
+    }
   }
-  // sort: ng first, then by largest abs change
+  // 警告(ng)を先頭、その中で変化量(絶対値)の大きい順
   out.sort((x,y)=>{
-    if(x.a.level!==y.a.level) return x.a.level==='ng' ? -1 : 1;
-    const xp = Math.max(Math.abs(x.a.pct1||0), Math.abs(x.a.pct3||0), Math.abs(x.a.pct6||0));
-    const yp = Math.max(Math.abs(y.a.pct1||0), Math.abs(y.a.pct3||0), Math.abs(y.a.pct6||0));
-    return yp - xp;
+    if(x.a.level !== y.a.level) return x.a.level === 'ng' ? -1 : 1;
+    return (y.a._absDiff || 0) - (x.a._absDiff || 0);
   });
   return out;
 }
@@ -3438,9 +3794,10 @@ function renderAlerts(){
   renderRuleDesc();
   const all = collectAlerts();
   let items = all;
-  if(alFilter==='ng') items = items.filter(x=> x.a.level==='ng');
-  if(alFilter==='dn') items = items.filter(x=> (x.a.diff1||0)<0 || (x.a.diff3||0)<0 || (x.a.diff6||0)<0);
-  if(alFilter==='up') items = items.filter(x=> (x.a.diff1||0)>0 || (x.a.diff3||0)>0 || (x.a.diff6||0)>0);
+  if(alFilter==='ng') items = items.filter(x => x.a.level === 'ng');
+  // 増加 / 減少 はエントリ単位の方向（_entryDir）で純粋にフィルタ
+  if(alFilter==='dn') items = items.filter(x => alertDir(x.a) === 'dn');
+  if(alFilter==='up') items = items.filter(x => alertDir(x.a) === 'up');
 
   const list = $('#alList');
   list.innerHTML = '';
@@ -3690,12 +4047,92 @@ $('#inMealEdit')?.addEventListener('click', ()=>{
   openResident(rid);
 });
 
+/* 設定画面のストレージ診断パネル：保存状態・バックアップ世代・容量を可視化 */
+function renderStorageDiag(){
+  const el = $('#storageDiag');
+  if(!el) return;
+  // 最終保存時刻
+  const lastIso = _lastSaveAt || (()=>{ try{ return localStorage.getItem(LS_LAST_SAVE) || ''; }catch(e){ return ''; } })();
+  const lastEl = $('#sdLastSave');
+  if(lastEl){
+    if(lastIso){
+      const dt = new Date(lastIso);
+      const ok = !isNaN(dt.getTime());
+      lastEl.textContent = ok ? `${dt.toLocaleString('ja-JP')} ${_lastSaveOk ? '✅' : '⚠️ 直近保存に失敗'}` : '不明';
+      lastEl.className = 'sd-v ' + (_lastSaveOk ? 'ok' : 'warn');
+    } else {
+      lastEl.textContent = '未保存';
+      lastEl.className = 'sd-v';
+    }
+  }
+  // 件数
+  const cEl = $('#sdCounts');
+  if(cEl){
+    const rN = (DB.residents || []).length;
+    const recN = (DB.records || []).length;
+    cEl.textContent = `入居者 ${rN}名 / 体重記録 ${recN}件`;
+    cEl.className = 'sd-v ok';
+  }
+  // バックアップ状態
+  const bEl = $('#sdBackup');
+  if(bEl){
+    let b1 = 0, b2 = 0;
+    try{ b1 = (localStorage.getItem(LS_BAK)  || '').length; }catch(e){}
+    try{ b2 = (localStorage.getItem(LS_BAK2) || '').length; }catch(e){}
+    const fmt = n => n > 1024 ? (n/1024).toFixed(1)+'KB' : n+'B';
+    bEl.textContent = `1世代前 ${b1?fmt(b1):'なし'} / 2世代前 ${b2?fmt(b2):'なし'}`;
+    bEl.className = 'sd-v ' + ((b1 || b2) ? 'ok' : '');
+    const rec = $('#sdRecover');
+    if(rec) rec.disabled = !(b1 || b2);
+  }
+  // 使用容量（推定）
+  const uEl = $('#sdUsage');
+  if(uEl){
+    let total = 0;
+    try{
+      for(let i=0; i<localStorage.length; i++){
+        const k = localStorage.key(i); if(!k) continue;
+        const v = localStorage.getItem(k) || '';
+        total += k.length + v.length;
+      }
+    }catch(e){}
+    uEl.textContent = total > 1024*1024
+      ? (total/1024/1024).toFixed(2) + ' MB'
+      : total > 1024
+        ? (total/1024).toFixed(1) + ' KB'
+        : total + ' B';
+    uEl.className = 'sd-v ' + (total > 4*1024*1024 ? 'warn' : 'ok');
+  }
+}
+$('#sdRefresh')?.addEventListener('click', renderStorageDiag);
+$('#sdRecover')?.addEventListener('click', ()=>{
+  const bak1 = _readDbFromKey(LS_BAK);
+  const bak2 = _readDbFromKey(LS_BAK2);
+  const cand = bak1 || bak2;
+  if(!cand){ toast('利用可能なバックアップがありません','err'); return; }
+  const which = bak1 ? '1世代前' : '2世代前';
+  if(!confirm(`バックアップ（${which}）から復元します。\n現在のデータは置き換えられます。続行しますか？`)) return;
+  // 念のため現状をさらに backup へ退避（save() のローテーションが回る）
+  DB = cand;
+  if(typeof normalizeAllResidents === 'function') normalizeAllResidents();
+  const ok = save();
+  if(typeof renderCfg === 'function') renderCfg();
+  if(typeof renderList === 'function') renderList();
+  if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
+  populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+  populateResidentSelect($('#ivResident'), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+  if(typeof updateAlertBadge === 'function') updateAlertBadge();
+  toast(ok ? `✅ ${which}のバックアップから復元しました` : '⚠️ 復元に失敗しました', ok?'ok':'err');
+});
+window.addEventListener('wtmgr-saved', ()=>{ if(document.querySelector('.scr[data-sc="cfg"].on')) renderStorageDiag(); });
+
 function renderCfg(){
   // 設定画面の入居者一覧。長期運用で混入し得る欠損データ（name 欠落・id 欠落・null
   // 要素・サーバ由来の不完全行など）を1件たりとも例外で落とさず、必ず描画完了する。
   const list = $('#cfgList');
   if(!list) return;  // cfg 画面 DOM が未ロード（保険）
   try{ renderThrEditor(); }catch(e){ console.warn('renderThrEditor:', e); }
+  try{ renderStorageDiag(); }catch(e){ console.warn('renderStorageDiag:', e); }
 
   // 1) 不正エントリを除外して妥当な配列を作る（id が文字列であることを必須とする）
   const all = Array.isArray(DB.residents) ? DB.residents : [];
@@ -4181,6 +4618,8 @@ $('#cfgFile').addEventListener('change', async e=>{
     // インポート直後に入居者の name/room を文字列化（古いバックアップ or
     // GAS 由来のJSONで型崩れがある可能性に備える）
     if(Array.isArray(DB.residents)) DB.residents.forEach(r => normalizeResident(r));
+    // 体重記録の yearMonth/measuredOn の型崩れも修正
+    if(Array.isArray(DB.records)) DB.records.forEach(r => normalizeRecord(r));
     let finalUrl = currentUrl;
     if(fileUrl && fileUrl !== currentUrl){
       finalUrl = confirm(
