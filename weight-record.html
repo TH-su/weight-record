@@ -470,6 +470,15 @@ textarea{resize:vertical;min-height:60px}
 .api-help li{margin-bottom:8px}
 .api-help code{background:var(--g1);padding:1px 5px;border-radius:4px;font-size:10px;
   font-family:ui-monospace,Menlo,Consolas,monospace}
+/* URL 保存済み ステータス表示（永続化されている事を視覚的に明示） */
+.api-persist-badge{display:inline-block;margin-left:8px;padding:2px 9px;font-size:10px;font-weight:700;
+  background:#e8f5e9;color:#1b5e20;border:1px solid #66bb6a;border-radius:10px;vertical-align:middle;
+  letter-spacing:.5px}
+.api-persist-badge.is-partial{background:#fff8e1;color:#e65100;border-color:#ffb74d}
+.api-persist-detail{margin-top:6px;padding:6px 10px;font-size:11px;line-height:1.55;
+  background:#f1f8e9;border:1px solid #c5e1a5;border-radius:6px;color:#33691e;
+  font-family:ui-monospace,Menlo,Consolas,monospace}
+.api-persist-detail.is-partial{background:#fff3e0;border-color:#ffb74d;color:#e65100}
 
 /* 生年月日 三分割入力 + 和暦ヘルパー */
 .bd-trio{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
@@ -964,8 +973,9 @@ select option.is-discharged{color:var(--g6)}
       クラウド（Google Sheets）経由で他の端末と自動同期されます。
     </div>
     <div class="fg">
-      <label class="fl">GAS Web App URL</label>
+      <label class="fl">GAS Web App URL <span id="apiPersistBadge" class="api-persist-badge" style="display:none">保存済み</span></label>
       <input type="text" id="cfgApi" placeholder="https://script.google.com/macros/s/〇〇〇/exec">
+      <div id="apiPersistDetail" class="api-persist-detail" style="display:none"></div>
     </div>
     <div class="ex-r">
       <button class="bn bp bsm" id="btnApiSave">💾 URLを保存・接続</button>
@@ -1391,22 +1401,41 @@ setTimeout(()=>{
 const API_KEY = 'wtmgr_api_url';
 const LS_PQ   = 'wtmgr_pq_v1';
 
-/* GAS Web App URL の永続化
+/* GAS Web App URL の永続化（三層独立バックアップ）
    ------------------------------------------------------------
-   - localStorage[API_KEY]  : 一次保存（このアプリの軽量キー）
-   - DB.apiUrl              : 二次保存（DB と同じ wtmgr_v1 キー内）
-   両方に同時書き込みすることで、片方が消えても他方から復元できる。
-   想定される消失パターン：
-     * Safari ITP が 7日のアイドル後に個別 LS キーを消す
-     * ユーザが「全データ削除」を押す（DB は消えるが API_KEY は残る）
-     * ユーザが「JSON インポート」する（DB は置換、API_KEY は残る）
-   どのパターンでも、二箇所に書いていれば復元可能。
+   現場の複数端末で「次回起動時にURLが消える」現象が報告されたため、
+   独立した3つのLSキーに同時書き込みする冗長化を行う：
 
-   さらに setItem 後に getItem で読み戻して **検証** することで、
-   プライベートモード・容量超過・SW 介入などの「黙って失敗」を捕捉する。 */
+     Layer 1: localStorage['wtmgr_api_url'] (API_KEY)   ← 最速の単一キー
+     Layer 2: DB.apiUrl  → localStorage['wtmgr_v1']      ← データと同居
+     Layer 3: UI.apiUrl  → localStorage['wtmgr_ui_v1']   ← UI状態と同居
+
+   3キーいずれかが残っていれば自動復元する。さらに：
+     - navigator.storage.persist() を呼び、ブラウザに永続化を依頼
+       （Safari ITP の自動消去対象から外れる可能性が高くなる）
+     - save() 呼び出しの度に API_KEY を再書き込みして ITP のアクセス時刻を更新
+     - beforeunload / visibilitychange のタイミングでも 1 回追加保存
+   現場で「URLが消える」状態を物理的に発生不可能にするのが目的。 */
+
+/* ブラウザに「データを消さないで」と依頼。granted されれば Safari ITP の対象外に */
+let _persistRequested = false;
+async function requestPersistentStorage(){
+  if(_persistRequested) return;
+  _persistRequested = true;
+  try{
+    if(navigator?.storage?.persist){
+      const granted = await navigator.storage.persist();
+      console.info('navigator.storage.persist() →', granted ? 'granted' : 'denied');
+    }
+  }catch(e){ console.warn('persist() failed:', e); }
+}
+
 function saveApiUrl(url){
   const v = (url || '').trim();
-  let lsOk = false, dbOk = false;
+  let lsOk = false, dbOk = false, uiOk = false;
+  // 0) メモリ参照を先に更新（このあと save() を呼ぶと wrapper が API_KEY を
+  //    再書き込みするので、apiUrl が新値を反映していないと旧値で上書きされる）
+  apiUrl = v;
   // 1) 一次保存: localStorage[API_KEY] と読み戻し検証
   try{
     if(v) localStorage.setItem(API_KEY, v);
@@ -1429,37 +1458,111 @@ function saveApiUrl(url){
     console.warn('saveApiUrl: DB save failed:', e.message);
     dbOk = false;
   }
-  // 3) メモリ上の参照も更新
-  apiUrl = v;
-  return { ok: (lsOk || dbOk), lsOk, dbOk };
+  // 3) 三次保存: UI 状態キー（wtmgr_ui_v1）にも独立して書き込む
+  try{
+    if(typeof saveUI === 'function') saveUI({ apiUrl: v });
+    if(typeof UI === 'object' && UI){ UI.apiUrl = v; }
+    // 検証: 別途読み戻す
+    let uiRaw = null;
+    try{ uiRaw = JSON.parse(localStorage.getItem(LS_UI) || '{}'); }catch(e){}
+    uiOk = (uiRaw && (uiRaw.apiUrl || '') === v);
+  }catch(e){
+    console.warn('saveApiUrl: UI save failed:', e.message);
+    uiOk = false;
+  }
+  // 4) 永続化リクエスト（保存に成功し、かつ URL がある時のみ）
+  if(v && (lsOk || dbOk || uiOk)) requestPersistentStorage();
+  // 5) バッジを最新状態に反映（DOM があれば）
+  try{ if(typeof refreshUrlPersistBadge === 'function') refreshUrlPersistBadge(); }catch(e){}
+  return { ok: (lsOk || dbOk || uiOk), lsOk, dbOk, uiOk };
 }
 
 function clearApiUrl(){
   return saveApiUrl('');
 }
 
-/* 起動時：一次が空なら二次（DB.apiUrl）から復元し、両方を再書き込み。
-   両方が一致しているのが正常状態なので、不一致なら一次に揃える。 */
+/* 起動時：三層のどれかから URL を復元し、全層を整合化する。
+   - 一次優先（最も新しい書き込み経路）→ 二次 → 三次の順で勝者を決定
+   - 勝者を全層に書き戻して、次回以降は1ステップで復元できるようにする */
 function loadApiUrlOnBoot(){
-  let primary = '';
-  try{ primary = localStorage.getItem(API_KEY) || ''; }catch(e){}
-  const secondary = (typeof DB === 'object' && DB && typeof DB.apiUrl === 'string') ? DB.apiUrl : '';
-  // 両方空なら何もしない
-  if(!primary && !secondary) return '';
-  // 一次優先：両方非空で値違いの場合は一次に従って二次を更新
-  const winner = primary || secondary;
-  // 失われていた側を補填して整合化
-  if(winner && (primary !== winner || secondary !== winner)){
+  let primary = '', secondary = '', tertiary = '';
+  try{ primary   = localStorage.getItem(API_KEY) || ''; }catch(e){}
+  try{ secondary = (typeof DB === 'object' && DB && typeof DB.apiUrl === 'string') ? DB.apiUrl : ''; }catch(e){}
+  try{
+    const uiRaw = JSON.parse(localStorage.getItem(LS_UI) || '{}');
+    tertiary = (typeof uiRaw.apiUrl === 'string') ? uiRaw.apiUrl : '';
+  }catch(e){}
+
+  // 3層すべて空なら未設定
+  if(!primary && !secondary && !tertiary) return '';
+
+  // 勝者を決める：一次 > 二次 > 三次（最も新しい書き込み経路を優先）
+  const winner = primary || secondary || tertiary;
+  // どこかが消えていれば再保存して整合化
+  if(winner && (primary !== winner || secondary !== winner || tertiary !== winner)){
+    const lost = [];
+    if(!primary)   lost.push('LS');
+    if(!secondary) lost.push('DB');
+    if(!tertiary)  lost.push('UI');
     saveApiUrl(winner);
-    if(!primary && secondary){
-      // 一次が消えていた → ITP 等による消失。コンソールに記録。
-      console.info('apiUrl recovered from DB.apiUrl backup');
-    }
+    console.info(`apiUrl recovered (lost layers: ${lost.join(',')||'none'})`);
   }
   return winner;
 }
 
 let apiUrl = '';  // wireSync IIFE / loadApiUrlOnBoot 経由で初期化（DB ロード後）
+
+/* save() フックを追加：DB を localStorage に書き出す度に API_KEY を「触る」ことで、
+   Safari ITP の最終アクセス時刻を更新し、7日後の自動消去を抑止する。
+   ※ save() は data layer の `function save(){...}` を直接書き換える代わりに
+     ここで wrap する（呼び出し全体に影響）。 */
+(function wrapSaveForITPDefense(){
+  if(typeof save !== 'function') return;
+  const _origSave = save;
+  // 再代入で全呼び出し元に伝播（save は const ではなく function 宣言なので可）
+  save = function(){
+    const r = _origSave.apply(this, arguments);
+    // 既に URL が設定されていれば API_KEY を再 touch（書き込みでアクセス扱い）
+    try{
+      if(apiUrl){
+        const cur = localStorage.getItem(API_KEY) || '';
+        if(cur !== apiUrl) localStorage.setItem(API_KEY, apiUrl);
+      }
+    }catch(e){}
+    return r;
+  };
+})();
+
+/* ページが閉じられる/バックグラウンドに行く瞬間にも「最後のひと押し」で再保存。
+   iOS Safari でタブ離脱時に LS 書き込みが切り捨てられる稀なケースに備える。 */
+(function installUrlSurvivalHooks(){
+  function lastDitchSave(){
+    try{
+      if(apiUrl){
+        // 三層に確実に書き込んでから離脱
+        try{ localStorage.setItem(API_KEY, apiUrl); }catch(e){}
+        try{
+          const uiRaw = JSON.parse(localStorage.getItem(LS_UI) || '{}');
+          uiRaw.apiUrl = apiUrl;
+          localStorage.setItem(LS_UI, JSON.stringify(uiRaw));
+        }catch(e){}
+        try{
+          if(typeof DB === 'object' && DB){
+            DB.apiUrl = apiUrl;
+            localStorage.setItem(LS_KEY, JSON.stringify(DB));
+          }
+        }catch(e){}
+      }
+    }catch(e){}
+  }
+  window.addEventListener('beforeunload', lastDitchSave);
+  // モバイル/タブ離脱は visibilitychange の方が確実に発火することがある
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState === 'hidden') lastDitchSave();
+  });
+  // pagehide は iOS Safari でも信頼できる
+  window.addEventListener('pagehide', lastDitchSave);
+})();
 
 function apiSetStatus(st, msg){
   const b = document.getElementById('apiBd');
@@ -4758,11 +4861,54 @@ $('#cfgSample').addEventListener('click', ()=>{
 /* ============================================================
    Cloud sync wiring (settings UI + auto-pull on startup)
    ============================================================ */
+/* URL 保存状態をUIに反映：三層のどこに保存されているかをユーザに見せる。
+   完全に揃っている=緑「保存済み」、一部欠落=黄「一部のみ保存」、全空=非表示。
+   保存・解除・診断・同期 のあらゆる経路から呼ばれる。 */
+function refreshUrlPersistBadge(){
+  const badge  = $('#apiPersistBadge');
+  const detail = $('#apiPersistDetail');
+  if(!badge || !detail) return;
+  let primary = '', secondary = '', tertiary = '';
+  try{ primary   = localStorage.getItem(API_KEY) || ''; }catch(e){}
+  try{ secondary = (typeof DB === 'object' && DB && DB.apiUrl) || ''; }catch(e){}
+  try{
+    const ui = JSON.parse(localStorage.getItem(LS_UI) || '{}');
+    tertiary = ui.apiUrl || '';
+  }catch(e){}
+  const layers = [
+    { name:'LS',    ok: !!primary,   match: primary   === apiUrl },
+    { name:'DB',    ok: !!secondary, match: secondary === apiUrl },
+    { name:'UI',    ok: !!tertiary,  match: tertiary  === apiUrl },
+  ];
+  const okCount = layers.filter(l => l.match).length;
+  if(!apiUrl){
+    badge.style.display = 'none';
+    detail.style.display = 'none';
+    return;
+  }
+  if(okCount === 3){
+    badge.style.display = '';
+    badge.classList.remove('is-partial');
+    badge.textContent = '✓ 保存済み';
+    detail.style.display = '';
+    detail.classList.remove('is-partial');
+    detail.textContent = `三層すべて一致 (LS / DB / UI) → …${apiUrl.slice(-30)}`;
+  } else {
+    badge.style.display = '';
+    badge.classList.add('is-partial');
+    badge.textContent = `△ ${okCount}/3 層のみ`;
+    detail.style.display = '';
+    detail.classList.add('is-partial');
+    detail.textContent = '保存状態: ' + layers.map(l => `${l.name}${l.match?'✓':'×'}`).join(' / ');
+  }
+}
+
 (function wireSync(){
-  // 起動時：localStorage / DB.apiUrl のいずれかから URL を復元し、両方に揃える
+  // 起動時：3層 (LS / DB.apiUrl / UI.apiUrl) のいずれかから URL を復元し、全層を揃える
   apiUrl = loadApiUrlOnBoot();
   const cfgApi = $('#cfgApi');
   if(cfgApi) cfgApi.value = apiUrl || '';
+  refreshUrlPersistBadge();
   if(apiUrl){
     apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + apiUrl.slice(-40));
     // initial pull — non-blocking
@@ -4790,16 +4936,20 @@ $('#cfgSample').addEventListener('click', ()=>{
     if(!url.startsWith('https://script.google.com/')){
       toast('GAS Web App のURL (https://script.google.com/〜) を確認してください','err'); return;
     }
-    // 二箇所（LS + DB）に保存し、setItem の成功を読み戻して検証
+    // 三層（LS + DB + UI）に保存し、setItem の成功を読み戻して検証
     const sv = saveApiUrl(url);
+    refreshUrlPersistBadge();
     if(!sv.ok){
       toast('⚠️ URLの保存に失敗しました（プライベートブラウズ等）。設定を確認してください','err');
-      apiSetStatus('er', 'URLの保存に失敗（LS×・DB×）');
+      apiSetStatus('er', 'URLの保存に失敗（LS×・DB×・UI×）');
       return;
     }
-    if(!sv.lsOk){
-      // 一次は失敗したが二次は成功（次回起動時に自動復元される）
-      toast('⚠️ 一次保存に失敗。バックアップ側のみで継続（再起動時に復元します）','err');
+    const failed = [];
+    if(!sv.lsOk) failed.push('LS');
+    if(!sv.dbOk) failed.push('DB');
+    if(!sv.uiOk) failed.push('UI');
+    if(failed.length){
+      toast(`⚠️ 一部の保存層が失敗（${failed.join(',')}）。他層から復元できます`,'err');
     }
     apiSetStatus('sy','接続中...');
     hideDiagPanel();
@@ -4813,6 +4963,7 @@ $('#cfgSample').addEventListener('click', ()=>{
       const diag = await apiDiagnose(url);
       showDiagPanel(diag.lines, diag.ok);
     }
+    refreshUrlPersistBadge();
   });
   $('#btnApiDiagnose')?.addEventListener('click', async ()=>{
     const url = ($('#cfgApi').value || apiUrl || '').trim();
@@ -4831,15 +4982,17 @@ $('#cfgSample').addEventListener('click', ()=>{
       const diag = await apiDiagnose(apiUrl);
       showDiagPanel(diag.lines, diag.ok);
     }
+    refreshUrlPersistBadge();
   });
   $('#btnApiClear')?.addEventListener('click', ()=>{
     if(!confirm('サーバー連携を解除します。ローカルデータは残ります。続行しますか？')) return;
-    // 一次・二次の両方からクリア
+    // 三層すべてからクリア
     clearApiUrl();
     if($('#cfgApi')) $('#cfgApi').value = '';
     apiSetStatus('of');
     $('#apiStatus').textContent = 'GASをデプロイして取得したURLを入力して「URLを保存・接続」を押してください。';
     hideDiagPanel();
+    refreshUrlPersistBadge();
     toast('連携を解除しました');
   });
   // replay any pending writes when the network comes back
