@@ -810,7 +810,7 @@ select option.is-discharged{color:var(--g6)}
       <table class="ht" id="ivHist">
         <thead>
           <tr>
-            <th style="text-align:left;padding-left:10px">入力日</th>
+            <th style="text-align:left;padding-left:10px">対象月</th>
             <th>体重(kg)</th>
             <th>BMI</th>
             <th>前月比</th>
@@ -3740,19 +3740,20 @@ function drawStats(rid){
          `開始${first.weight.toFixed(1)}→現${last.weight.toFixed(1)} (${diffTotal>0?'+':''}${diffTotal.toFixed(1)}kg)`);
 }
 
-/* 記録履歴の並び順キー：表示している「入力日」（updatedAt or createdAt）を
-   主キーに、欠損時は measuredOn → yearMonth+'-01' でフォールバック。
-   これにより 1 列目に表示される時刻と完全に整合した降順並びになる。 */
+/* 記録履歴の並び順キー：**対象月（yearMonth）を主キー** にして降順。
+   同月内の複数記録は入力日（updatedAt or createdAt）の降順で並ぶ。
+   measuredOn は最後の保険として使用。
+   これにより 1 列目に表示する「対象月」と完全に整合した降順並びになる。 */
 function _histSortKey(r){
   if(!r) return '';
+  // 第1キー：対象月（YYYY-MM）
+  var ym = (typeof r.yearMonth === 'string' && r.yearMonth) ? r.yearMonth : '0000-00';
+  // 第2キー：入力日（最終更新 → 作成 → 測定日 の優先順）
   var stamp = (typeof r.updatedAt === 'string' && r.updatedAt) ? r.updatedAt
             : (typeof r.createdAt === 'string' && r.createdAt) ? r.createdAt
+            : (typeof r.measuredOn === 'string' && r.measuredOn) ? r.measuredOn
             : '';
-  var measured = (typeof r.measuredOn === 'string' && r.measuredOn) ? r.measuredOn
-               : (r.yearMonth ? r.yearMonth + '-01' : '0000-00-00');
-  // 入力日(stamp) を最優先。無ければ measuredOn にフォールバック。
-  // 末尾に measured を付与して同タイムスタンプの安定ソートを担保。
-  return (stamp || measured) + '#' + measured;
+  return ym + '#' + stamp;
 }
 
 function drawHist(rid){
@@ -3791,7 +3792,8 @@ function drawHist(rid){
     const chairBadge = r.measureMode==='chair'
       ? `<span class="wc-badge" title="実測${r.rawWeight?.toFixed(1)}kg − 車椅子${r.wheelchairKg?.toFixed(1)}kg">車椅子</span>`
       : '';
-    // 入力日（日時）：updatedAt があれば最終更新時刻、無ければ createdAt の日時を表示
+    // 「対象月」を上段にメインで、「入力日」を下段にサブとして表示。
+    // 入力日：updatedAt があれば最終更新時刻、無ければ createdAt の日時を表示。
     // ローカルタイムで「YYYY/M/D HH:MM」に整形。タイムスタンプが無い古いデータは
     // 測定日（YYYY-MM-DD）にフォールバック。
     const _ts = r.updatedAt || r.createdAt;
@@ -3809,9 +3811,11 @@ function drawHist(rid){
         }
       }catch(e){}
     }
-    if(!stampLabel) stampLabel = r.measuredOn || ymFmt(r.yearMonth) || '';
+    if(!stampLabel) stampLabel = r.measuredOn || '';
     const updatedTag = r.updatedAt ? ' <small style="color:var(--g5)">更新</small>' : '';
-    const dateLabel = `<b>${stampLabel}</b>${updatedTag}<br><small style="color:var(--g6)">対象月 ${ymFmt(r.yearMonth)}</small>`;
+    // 上段：対象月（太字・大きめ・濃色）／下段：入力日（小さく・薄いグレー）
+    const dateLabel = `<b>${ymFmt(r.yearMonth)}</b>` +
+                      `<br><small style="color:var(--g6);font-weight:400">入力 ${stampLabel}${updatedTag}</small>`;
     tr.innerHTML = `
       <td style="text-align:left;padding-left:10px">${dateLabel}</td>
       <td><b>${r.weight.toFixed(1)}</b>${chairBadge?`<br>${chairBadge}`:''}</td>
