@@ -208,11 +208,24 @@ textarea{resize:vertical;min-height:60px}
 .st-s{font-size:10px;color:var(--g6);margin-top:1px}
 
 /* history table for individual */
-.ht{width:100%;border-collapse:collapse;background:#fff;font-size:12px}
-.ht th{background:var(--g1);color:var(--g7);padding:8px 6px;text-align:center;font-weight:700;font-size:11px;white-space:nowrap}
+.ht{width:100%;border-collapse:separate;border-spacing:0;background:#fff;font-size:12px}
+.ht th{background:var(--g1);color:var(--g7);padding:8px 6px;text-align:center;font-weight:700;font-size:11px;white-space:nowrap;
+  border-bottom:1px solid var(--g2)}
 .ht td{padding:8px 6px;border-bottom:1px solid var(--g1);text-align:center;vertical-align:middle}
 .ht td:first-child{text-align:left;padding-left:10px;white-space:nowrap;font-weight:700}
 .ht tr.ed td{background:#fff8e1}
+/* 個別画面の記録履歴ラッパー：表自体に縦スクロールを持たせる。
+   外側ページではなく、この .lt-w-scroll コンテナ内でスクロールするため、
+   position:sticky が確実に「コンテナの上端」に固定される。
+   max-height は viewport から topbar 分（CSS変数）と余白 (約 80px) を差し引いた値。 */
+.lt-w-scroll{max-height:calc(100vh - var(--topbar-h,96px) - 80px);overflow-y:auto;
+  /* iOS Safari でのスムーズスクロール */
+  -webkit-overflow-scrolling:touch}
+
+/* 個別画面の記録履歴：ヘッダ行を表内スクロール時に最上段固定 */
+#ivHist thead th{position:sticky;top:0;z-index:5;
+  /* sticky は border-bottom が消える挙動を避けるため box-shadow で下線を補強 */
+  box-shadow:inset 0 -1px 0 var(--g2)}
 
 /* settings */
 .rli{display:flex;align-items:center;justify-content:space-between;
@@ -793,7 +806,7 @@ select option.is-discharged{color:var(--g6)}
       <span>記録履歴</span>
       <span class="cd-t-r" id="ivHistCount">—</span>
     </div>
-    <div class="lt-w">
+    <div class="lt-w lt-w-scroll">
       <table class="ht" id="ivHist">
         <thead>
           <tr>
@@ -3727,10 +3740,31 @@ function drawStats(rid){
          `開始${first.weight.toFixed(1)}→現${last.weight.toFixed(1)} (${diffTotal>0?'+':''}${diffTotal.toFixed(1)}kg)`);
 }
 
+/* 記録履歴の並び順キー：表示している「入力日」（updatedAt or createdAt）を
+   主キーに、欠損時は measuredOn → yearMonth+'-01' でフォールバック。
+   これにより 1 列目に表示される時刻と完全に整合した降順並びになる。 */
+function _histSortKey(r){
+  if(!r) return '';
+  var stamp = (typeof r.updatedAt === 'string' && r.updatedAt) ? r.updatedAt
+            : (typeof r.createdAt === 'string' && r.createdAt) ? r.createdAt
+            : '';
+  var measured = (typeof r.measuredOn === 'string' && r.measuredOn) ? r.measuredOn
+               : (r.yearMonth ? r.yearMonth + '-01' : '0000-00-00');
+  // 入力日(stamp) を最優先。無ければ measuredOn にフォールバック。
+  // 末尾に measured を付与して同タイムスタンプの安定ソートを担保。
+  return (stamp || measured) + '#' + measured;
+}
+
 function drawHist(rid){
   const body = $('#ivHistBody');
-  // show ALL records (including multiple-per-month), newest first
-  const recs = rid ? getAllRecordsOf(rid).slice().reverse() : [];
+  // show ALL records (including multiple-per-month), newest first.
+  // 明示的に降順ソート：getAllRecordsOf の昇順 + reverse に依存せず、
+  // measuredOn / createdAt 等のキーで安定して「最新入力が最上段」に並ぶ。
+  const recs = rid
+    ? DB.records.filter(r => r.residentId === rid)
+                .slice()
+                .sort((a, b) => _histSortKey(b).localeCompare(_histSortKey(a)))
+    : [];
   const resident = rid ? residentById(rid) : null;
   body.innerHTML = '';
   if(recs.length===0){
@@ -5009,6 +5043,20 @@ populateResidentSelect($('#inResident'), {preferId: UI.inRes});
 populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
 goto(['list','input','indiv','grid','alert','cfg'].includes(UI.tab) ? UI.tab : 'list');
 updateAlertBadge();
+
+/* sticky thead が topbar の真下にぴったり貼り付くよう、CSS変数 --topbar-h を
+   実測値で更新する。リサイズ・タブ切替で高さが変わる可能性に追従。 */
+function applyStickyTopOffset(){
+  const topbar = document.querySelector('.topbar');
+  if(!topbar) return;
+  const h = topbar.getBoundingClientRect().height;
+  if(h > 0) document.documentElement.style.setProperty('--topbar-h', Math.ceil(h) + 'px');
+}
+applyStickyTopOffset();
+window.addEventListener('resize', applyStickyTopOffset);
+window.addEventListener('orientationchange', applyStickyTopOffset);
+// レイアウトが安定した後にも一度
+setTimeout(applyStickyTopOffset, 200);
 
 /* close modal when clicking outside */
 $('#mdResident').addEventListener('click', e=>{
