@@ -1229,6 +1229,23 @@ function bmiCat(bmi){
 
 const DEFAULT_DB = { residents:[], records:[] };
 
+/* ディープクローン。structuredClone は Safari 15.4 未満（古い iPad 等）で未対応のため、
+   利用可能なら使い、無ければ JSON ベースのクローンにフォールバックする。
+   DB は JSON シリアライズ可能なプレーンデータなので JSON クローンで十分。
+   ※ 起動時の load() で呼ばれるため、ここで例外が出るとアプリ全体が停止し
+     「クリックが効かない」状態になる。互換性を最優先する。 */
+function deepClone(obj){
+  try{
+    if(typeof structuredClone === 'function') return structuredClone(obj);
+  }catch(e){ /* fall through */ }
+  try{
+    return JSON.parse(JSON.stringify(obj));
+  }catch(e){
+    // 最後の保険：浅いコピー
+    return Array.isArray(obj) ? obj.slice() : Object.assign({}, obj);
+  }
+}
+
 /* localStorage から JSON を安全に取り出す。パース失敗・型不正は null を返す。
    サニティ：residents / records 配列のどちらか一方でも持つオブジェクト。 */
 function _readDbFromKey(key){
@@ -1269,7 +1286,7 @@ function load(){
         console.error('load: all DB keys were unreadable; starting empty');
         try{ sessionStorage.setItem('wtmgr_load_error', '1'); }catch(e){}
       }
-      return structuredClone(DEFAULT_DB);
+      return deepClone(DEFAULT_DB);
     }
     if(recoveredFrom){
       console.warn('load: recovered DB from '+recoveredFrom);
@@ -1305,7 +1322,7 @@ function load(){
       TOGGLES.forEach(t => r[t.k] = !!latest[t.k]);
     }
     return d;
-  }catch(e){ console.error(e); return structuredClone(DEFAULT_DB); }
+  }catch(e){ console.error(e); return deepClone(DEFAULT_DB); }
 }
 /* 永続化：try/catch + 読み戻し検証 + 二世代バックアップローテーション
    ----------------------------------------------------------------
@@ -1928,6 +1945,44 @@ const $$ = (s,r=document)=>[...r.querySelectorAll(s)];
 const uid = ()=> 'r'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
 const ymNow = ()=>{ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); };
 const dNow = ()=>{ const d=new Date(); return d.toISOString().slice(0,10); };
+
+/* ============================================================
+   タブナビゲーション・主要ボタンの「クラッシュ耐性」配線
+   ------------------------------------------------------------
+   初期化コードの後半で万一エラーが起きても、タブ移動・用紙作成が
+   必ず動作するよう、ユーティリティ直後に **イベント委任** で document に
+   1つだけリスナーを登録する。個別ボタンへの addEventListener と違い、
+   後続コードの実行可否に依存しないため「クリックが一切効かない」状態を防ぐ。
+   goto / openPrintSheet は関数宣言（巻き上げ）のため、クリック時には必ず利用可能。
+   ============================================================ */
+document.addEventListener('click', function(e){
+  const t = e.target;
+  if(!t || !t.closest) return;
+  // タブ切替
+  const tab = t.closest('.tnav button[data-go]');
+  if(tab){
+    try{
+      const target = tab.dataset.go;
+      if(target === 'input'){
+        try{
+          editingRecordId = null;
+          const ym = ymNow(), d = dNow();
+          const inMonth = $('#inMonth'), inDate = $('#inDate');
+          if(inMonth) inMonth.value = ym;
+          if(inDate)  inDate.value  = d;
+          if(typeof saveUI === 'function') saveUI({inMonth: ym});
+        }catch(err){ /* 入力タブ初期化失敗でもナビゲーションは継続 */ }
+      }
+      if(typeof goto === 'function') goto(target);
+    }catch(err){ /* ナビゲーションを止めない */ }
+    return;
+  }
+  // 用紙作成ボタン
+  if(t.closest('#btnPrintSheet')){
+    try{ if(typeof openPrintSheet === 'function') openPrintSheet(); }
+    catch(err){ try{ toast('用紙作成でエラーが発生しました', 'err'); }catch(e2){} }
+  }
+}, false);
 const ymPrev = (ym,step=1)=>{
   const [y,m] = ym.split('-').map(Number);
   const d = new Date(y, m-1-step, 1);
@@ -2297,34 +2352,22 @@ function analyze(residentId, ym){
 /* ============================================================
    Navigation
    ============================================================ */
-$$('.tnav button').forEach(b=>{
-  b.addEventListener('click', ()=>{
-    const target = b.dataset.go;
-    // 入力タブをメニューから開いた場合、対象月＝今月／測定日＝今日にリセット
-    if(target === 'input'){
-      editingRecordId = null;
-      const ym = ymNow();
-      const d  = dNow();
-      const inMonth = $('#inMonth');
-      const inDate  = $('#inDate');
-      if(inMonth) inMonth.value = ym;
-      if(inDate)  inDate.value  = d;
-      saveUI({inMonth: ym});
-    }
-    goto(target);
-  });
-});
+/* タブのクリック配線はユーティリティ直後の委任リスナーに集約済み（クラッシュ耐性のため）。
+   goto() は画面切替を先に行い、各 render はエラーで止まってもナビゲーションを妨げないよう
+   try/catch で隔離する。 */
 function goto(sc){
   $$('.tnav button').forEach(b=> b.classList.toggle('on', b.dataset.go===sc));
   $$('.scr').forEach(s=> s.classList.toggle('on', s.dataset.sc===sc));
-  saveUI({tab: sc});
-  if(sc==='list')  renderList();
-  if(sc==='input') renderInput();
-  if(sc==='indiv') renderIndiv();
-  if(sc==='grid')  renderGrid();
-  if(sc==='alert') renderAlerts();
-  if(sc==='cfg')   renderCfg();
-  window.scrollTo(0,0);
+  try{ saveUI({tab: sc}); }catch(e){}
+  try{
+    if(sc==='list')       renderList();
+    else if(sc==='input') renderInput();
+    else if(sc==='indiv') renderIndiv();
+    else if(sc==='grid')  renderGrid();
+    else if(sc==='alert') renderAlerts();
+    else if(sc==='cfg')   renderCfg();
+  }catch(e){ console.error('goto render error ('+sc+'):', e); }
+  try{ window.scrollTo(0,0); }catch(e){}
 }
 
 /* ============================================================
@@ -2365,6 +2408,68 @@ $('#listFilter').addEventListener('click', e=>{
    - 今月の測定値を記入できるブランクセルを用意
    - 全員分が A4 用紙１枚に収まるよう、人数に応じてフォントを自動圧縮
    ============================================================ */
+/* 印刷用 CSS をドキュメントに一度だけ注入する。
+   ポップアップ（window.open）はモバイル・WordPress・ブロッカー環境で失敗しやすいため、
+   同一ページ内のオーバーレイ + @media print 方式に変更。クリックは必ず動作する。 */
+function _ensurePrintSheetStyle(){
+  if(document.getElementById('psSheetStyle')) return;
+  const st = document.createElement('style');
+  st.id = 'psSheetStyle';
+  st.textContent = `
+  #printOverlay{display:none;position:fixed;inset:0;z-index:9999;background:#fff;overflow:auto;-webkit-overflow-scrolling:touch}
+  #printOverlay.on{display:block}
+  #printOverlay .ps-toolbar{position:sticky;top:0;background:#1565c0;color:#fff;padding:10px 14px;
+    display:flex;gap:10px;align-items:center;z-index:2;box-shadow:0 2px 6px rgba(0,0,0,.2)}
+  #printOverlay .ps-toolbar .ps-info{flex:1;font-size:13px;line-height:1.4}
+  #printOverlay .ps-toolbar button{background:#fff;color:#1565c0;border:none;padding:8px 18px;
+    border-radius:5px;font-weight:700;font-size:14px;cursor:pointer;white-space:nowrap}
+  #printOverlay .ps-toolbar button:active{transform:scale(.97)}
+  #printOverlay .ps-page{max-width:210mm;margin:0 auto;padding:10mm 12mm;background:#fff;color:#000;
+    font-family:"Hiragino Sans","Yu Gothic UI","Meiryo",sans-serif}
+  #printOverlay .ps-hd{display:flex;align-items:flex-end;justify-content:space-between;
+    border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:6px}
+  #printOverlay .ps-ttl{font-size:16pt;font-weight:700;letter-spacing:1px}
+  #printOverlay .ps-sub{font-size:9pt;color:#333}
+  #printOverlay .ps-meta{font-size:9pt;text-align:right;line-height:1.55;color:#000}
+  #printOverlay table.ps-tbl{width:100%;border-collapse:collapse;table-layout:fixed;
+    font-size:var(--ps-fz,11pt);font-variant-numeric:tabular-nums}
+  #printOverlay table.ps-tbl th,#printOverlay table.ps-tbl td{border:1px solid #555;
+    padding:var(--ps-padv,4px) 3px;text-align:center;height:var(--ps-rowh,13mm);line-height:1.15;overflow:hidden}
+  #printOverlay table.ps-tbl thead th{background:#e8eaed;font-weight:700;font-size:var(--ps-fzh,10pt);
+    line-height:1.15;padding:3px 2px;height:auto}
+  #printOverlay table.ps-tbl td.no{width:22px;color:#555;font-size:var(--ps-fzh,10pt)}
+  #printOverlay table.ps-tbl td.rm{width:32px;font-weight:700}
+  #printOverlay table.ps-tbl td.nm{text-align:left;padding-left:4px;font-weight:700;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  #printOverlay .wcb{display:inline-block;margin-left:3px;padding:0 4px;background:#1565c0;
+    color:#fff;border-radius:3px;font-size:var(--ps-wcb,8pt);vertical-align:middle}
+  #printOverlay table.ps-tbl td.prev,#printOverlay table.ps-tbl td.prev-chair,#printOverlay table.ps-tbl td.prev-net{
+    width:8%;font-weight:700;background:#fafafa}
+  #printOverlay table.ps-tbl td.prev-net{color:#0d47a1}
+  #printOverlay table.ps-tbl td.bl{background:#fff}
+  #printOverlay table.ps-tbl td.memo{width:18%;font-size:var(--ps-memo,10pt)}
+  #printOverlay .ps-ft{margin-top:6px;font-size:8pt;color:#444;display:flex;
+    justify-content:space-between;border-top:1px solid #999;padding-top:3px}
+  #printOverlay .ps-note{font-size:8pt;color:#555;margin-top:3px;line-height:1.45}
+  #printOverlay .ps-note b{color:#0d47a1}
+  @media print{
+    /* 用紙オーバーレイ表示中は、それ以外の全要素を隠して用紙だけ印刷する */
+    body.ps-active > *:not(#printOverlay){display:none !important}
+    body.ps-active #printOverlay{position:static !important;overflow:visible !important;display:block !important}
+    body.ps-active #printOverlay .ps-toolbar{display:none !important}
+    body.ps-active #printOverlay .ps-page{padding:0 !important;max-width:none !important}
+    body.ps-active{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    @page{size:A4 portrait;margin:10mm 12mm}
+  }`;
+  document.head.appendChild(st);
+}
+
+function closePrintSheet(){
+  const ov = document.getElementById('printOverlay');
+  if(ov) ov.classList.remove('on');
+  document.body.classList.remove('ps-active');
+}
+
 function openPrintSheet(){
   // 印刷対象月（list の対象月）と前月を計算
   const targetYm = listMonth || ymNow();
@@ -2378,7 +2483,6 @@ function openPrintSheet(){
     return;
   }
   // 人数に応じてフォントサイズと行高を自動調整（A4 縦：約 257mm の印刷可能高）
-  // 行高(mm) = ヘッダ/フッタを除いた約 220mm を人数で割る → 1行最低 6mm を確保
   const n = residents.length;
   let rowH, fz, padV;
   if(n <= 14)      { rowH = 13; fz = 11; padV = 4; }
@@ -2391,10 +2495,7 @@ function openPrintSheet(){
   function _bodyRow(r, idx){
     const prevRec = (typeof getRecord === 'function') ? getRecord(r.id, prevYm) : null;
     const isChair = (r.wheelchairKg != null && r.wheelchairKg > 0);
-    // 前月「実測値」: chair モードなら rawWeight、通常モードなら weight
-    let prevReal = '';
-    let prevChair = '';
-    let prevNet = '';
+    let prevReal = '', prevChair = '', prevNet = '';
     if(prevRec){
       if(prevRec.measureMode === 'chair' && prevRec.rawWeight != null){
         prevReal  = prevRec.rawWeight.toFixed(1);
@@ -2404,16 +2505,12 @@ function openPrintSheet(){
         prevReal = prevRec.weight.toFixed(1);
       }
     }
-    // 車椅子（マスター登録値）を補助情報として表示
     const chairKg = isChair ? r.wheelchairKg.toFixed(1) : '';
     const room = (r.room != null && r.room !== '') ? r.room : '－';
     const name = r.name || '（名前未設定）';
-    // 今月の測定値を書き込むブランク欄を 3 つ（実測値・車椅子重量・差引体重）用意。
-    // 通常モードは「実測値」のみ。車椅子モードは３つすべて意味があるので３列確保。
     const blankCells = isChair
-      ? `<td class="bl">${' '.repeat(12)}</td><td class="bl">${' '.repeat(8)}</td><td class="bl">${' '.repeat(8)}</td>`
-      : `<td class="bl" colspan="3">${' '.repeat(12)}</td>`;
-
+      ? `<td class="bl"></td><td class="bl"></td><td class="bl"></td>`
+      : `<td class="bl" colspan="3"></td>`;
     return `
       <tr>
         <td class="no">${idx + 1}</td>
@@ -2430,131 +2527,97 @@ function openPrintSheet(){
   const today = new Date();
   const todayStr = `${today.getFullYear()}年${today.getMonth()+1}月${today.getDate()}日`;
 
-  const html = `
-<!DOCTYPE html>
-<html lang="ja"><head>
-<meta charset="utf-8">
-<title>体重測定用紙 ${ymFmt(targetYm)}</title>
-<style>
-  @page { size: A4 portrait; margin: 10mm 12mm; }
-  *{box-sizing:border-box}
-  body{margin:0;font-family:"Hiragino Sans","Yu Gothic UI","Meiryo",sans-serif;color:#000}
-  .ph-hd{display:flex;align-items:flex-end;justify-content:space-between;
-    border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:6px}
-  .ph-ttl{font-size:16pt;font-weight:700;letter-spacing:1px}
-  .ph-sub{font-size:9pt;color:#333}
-  .ph-meta{font-size:9pt;text-align:right;line-height:1.55}
-  table{width:100%;border-collapse:collapse;table-layout:fixed;
-    font-size:${fz}pt;font-variant-numeric:tabular-nums}
-  th,td{border:1px solid #555;padding:${padV}px 3px;text-align:center;
-    height:${rowH}mm;line-height:1.15;overflow:hidden}
-  thead th{background:#e8eaed;font-weight:700;font-size:${Math.max(fz-1, 7)}pt;
-    line-height:1.15;padding:3px 2px;height:auto}
-  td.no{width:22px;color:#555;font-size:${Math.max(fz-1, 7)}pt}
-  td.rm{width:32px;font-weight:700}
-  td.nm{text-align:left;padding-left:4px;font-weight:700;white-space:nowrap;
-    overflow:hidden;text-overflow:ellipsis}
-  .wcb{display:inline-block;margin-left:3px;padding:0 4px;background:#1565c0;
-    color:#fff;border-radius:3px;font-size:${Math.max(fz-2, 6)}pt;vertical-align:middle}
-  td.prev,td.prev-chair,td.prev-net{width:8%;font-weight:700;background:#fafafa}
-  td.prev-net{color:#0d47a1}
-  td.bl{background:#fff}
-  td.memo{width:18%;font-size:${Math.max(fz-1, 7)}pt}
-  .ph-ft{margin-top:6px;font-size:8pt;color:#444;display:flex;
-    justify-content:space-between;border-top:1px solid #999;padding-top:3px}
-  .ph-note{font-size:8pt;color:#555;margin-top:3px;line-height:1.45}
-  .ph-note b{color:#0d47a1}
-  /* 印刷時にはツールバー類を非表示 */
-  @media print{
-    .no-print{display:none !important}
-    body{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-  }
-  /* ブラウザ閲覧時用のトップバー */
-  .toolbar{position:sticky;top:0;background:#1565c0;color:#fff;
-    padding:8px 12px;display:flex;gap:8px;align-items:center;z-index:100;
-    box-shadow:0 2px 6px rgba(0,0,0,.18)}
-  .toolbar button{background:#fff;color:#1565c0;border:none;padding:6px 14px;
-    border-radius:4px;font-weight:700;cursor:pointer;font-size:13px}
-  .toolbar button:hover{background:#e3f2fd}
-  .toolbar .ph-info{flex:1;font-size:13px}
-  .ph-wrap{padding:8mm 12mm;background:#fff;max-width:210mm;margin:0 auto}
-</style>
-</head><body>
-<div class="toolbar no-print">
-  <span class="ph-info">📄 ${ymFmt(targetYm)} 体重測定用紙（プレビュー）— 印刷ボタンで A4 横１枚に出力されます</span>
-  <button onclick="window.print()">🖨️ 印刷</button>
-  <button onclick="window.close()">✖ 閉じる</button>
-</div>
-<div class="ph-wrap">
-  <div class="ph-hd">
-    <div>
-      <div class="ph-ttl">体重測定記録用紙</div>
-      <div class="ph-sub">対象月：${ymFmt(targetYm)}</div>
+  // 用紙本体の HTML
+  const sheetHtml = `
+  <div class="ps-toolbar">
+    <span class="ps-info">📄 ${ymFmt(targetYm)} 体重測定用紙 — 「印刷」で A4 縦１枚に出力されます</span>
+    <button type="button" id="psPrintBtn">🖨️ 印刷</button>
+    <button type="button" id="psCloseBtn">✖ 閉じる</button>
+  </div>
+  <div class="ps-page">
+    <div class="ps-hd">
+      <div>
+        <div class="ps-ttl">体重測定記録用紙</div>
+        <div class="ps-sub">対象月：${ymFmt(targetYm)}</div>
+      </div>
+      <div class="ps-meta">
+        <div>作成日：${todayStr}</div>
+        <div>在籍 ${residents.length} 名</div>
+      </div>
     </div>
-    <div class="ph-meta">
-      <div>作成日：${todayStr}</div>
-      <div>在籍 ${residents.length} 名</div>
+    <table class="ps-tbl">
+      <colgroup>
+        <col style="width:22px"><col style="width:32px"><col>
+        <col style="width:8%"><col style="width:8%"><col style="width:8%">
+        <col style="width:8%"><col style="width:8%"><col style="width:8%">
+        <col style="width:18%">
+      </colgroup>
+      <thead>
+        <tr>
+          <th rowspan="2">№</th>
+          <th rowspan="2">部屋</th>
+          <th rowspan="2">氏名</th>
+          <th colspan="3" style="background:#fff3e0">前月（${ymFmt(prevYm)}）</th>
+          <th colspan="3" style="background:#e3f2fd">今月（${ymFmt(targetYm)}）測定値 ✏️</th>
+          <th rowspan="2">備考</th>
+        </tr>
+        <tr>
+          <th style="background:#fff3e0">実測<br><small>(kg)</small></th>
+          <th style="background:#fff3e0">車椅子<br><small>(kg)</small></th>
+          <th style="background:#fff3e0">差引<br><small>(kg)</small></th>
+          <th style="background:#e3f2fd">実測<br><small>(kg)</small></th>
+          <th style="background:#e3f2fd">車椅子<br><small>(kg)</small></th>
+          <th style="background:#e3f2fd">差引<br><small>(kg)</small></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${residents.map((r, i) => _bodyRow(r, i)).join('')}
+      </tbody>
+    </table>
+    <div class="ps-note">
+      <b>記入要領：</b>
+      通常モードの方は「実測」欄のみ。車椅子の方は「実測（車椅子込み）」と「車椅子重量」、差引体重を必要に応じて記入してください。
+      「車」マークは車椅子使用者です。前月の差引（青字）は前月実測 − 車椅子の値です。
     </div>
-  </div>
-  <table>
-    <colgroup>
-      <col style="width:22px"><col style="width:32px"><col>
-      <col style="width:8%"><col style="width:8%"><col style="width:8%">
-      <col style="width:8%"><col style="width:8%"><col style="width:8%">
-      <col style="width:18%">
-    </colgroup>
-    <thead>
-      <tr>
-        <th rowspan="2">№</th>
-        <th rowspan="2">部屋</th>
-        <th rowspan="2">氏名</th>
-        <th colspan="3" style="background:#fff3e0">前月（${ymFmt(prevYm)}）</th>
-        <th colspan="3" style="background:#e3f2fd">今月（${ymFmt(targetYm)}）測定値 ✏️</th>
-        <th rowspan="2">備考</th>
-      </tr>
-      <tr>
-        <th style="background:#fff3e0">実測<br><small>(kg)</small></th>
-        <th style="background:#fff3e0">車椅子<br><small>(kg)</small></th>
-        <th style="background:#fff3e0">差引<br><small>(kg)</small></th>
-        <th style="background:#e3f2fd">実測<br><small>(kg)</small></th>
-        <th style="background:#e3f2fd">車椅子<br><small>(kg)</small></th>
-        <th style="background:#e3f2fd">差引<br><small>(kg)</small></th>
-      </tr>
-    </thead>
-    <tbody>
-      ${residents.map((r, i) => _bodyRow(r, i)).join('')}
-    </tbody>
-  </table>
-  <div class="ph-note">
-    <b>記入要領：</b>
-    通常モードの方は「実測」欄のみ。車椅子の方は「実測（車椅子込み）」と「車椅子重量」、差引体重を必要に応じて記入してください。
-    「車」マークは車椅子使用者です。前月の差引（青字）は前月実測 − 車椅子の値です。
-  </div>
-  <div class="ph-ft">
-    <span>記録者：　　　　　　　　　　　</span>
-    <span>確認者：　　　　　　　　　　　</span>
-  </div>
-</div>
-<scr` + `ipt>
-  if(location.search.indexOf('print=1') >= 0){
-    setTimeout(function(){ window.print(); }, 250);
-  }
-</scr` + `ipt>
-</body></html>`;
+    <div class="ps-ft">
+      <span>記録者：　　　　　　　　　　　</span>
+      <span>確認者：　　　　　　　　　　　</span>
+    </div>
+  </div>`;
 
-  // 新しいタブを開いて HTML を流し込む
-  const w = window.open('', '_blank');
-  if(!w){
-    toast('ポップアップがブロックされました。許可してください。', 'err');
-    return;
+  // スタイル注入 → オーバーレイを取得/生成 → 内容差し込み → 表示
+  _ensurePrintSheetStyle();
+  let ov = document.getElementById('printOverlay');
+  if(!ov){
+    ov = document.createElement('div');
+    ov.id = 'printOverlay';
+    document.body.appendChild(ov);
   }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
+  // 自動サイズ用 CSS 変数
+  ov.style.setProperty('--ps-fz', fz + 'pt');
+  ov.style.setProperty('--ps-fzh', Math.max(fz-1, 7) + 'pt');
+  ov.style.setProperty('--ps-rowh', rowH + 'mm');
+  ov.style.setProperty('--ps-padv', padV + 'px');
+  ov.style.setProperty('--ps-wcb', Math.max(fz-2, 6) + 'pt');
+  ov.style.setProperty('--ps-memo', Math.max(fz-1, 7) + 'pt');
+  ov.innerHTML = sheetHtml;
+  ov.classList.add('on');
+  document.body.classList.add('ps-active');
+  ov.scrollTop = 0;
+
+  // ボタン配線
+  const printBtn = document.getElementById('psPrintBtn');
+  const closeBtn = document.getElementById('psCloseBtn');
+  if(printBtn) printBtn.addEventListener('click', ()=>{ window.print(); });
+  if(closeBtn) closeBtn.addEventListener('click', closePrintSheet);
 }
 
 /* 「🖨️ 用紙作成」ボタンの配線 */
 $('#btnPrintSheet')?.addEventListener('click', openPrintSheet);
+/* Esc キーで用紙を閉じる */
+document.addEventListener('keydown', e=>{
+  if(e.key === 'Escape' && document.body.classList.contains('ps-active')) closePrintSheet();
+});
 
 function renderList(){
   const body = $('#listBody');
@@ -5069,3 +5132,301 @@ $('#cfgFile').addEventListener('change', async e=>{
   }finally{ e.target.value=''; }
 });
 $('#cfgCsv').addEventListener('click', ()=>{
+  const header = ['name','room','heightCm','yearMonth','weight','bmi','measureMode','rawWeight','wheelchairKg','staple','stapleAmount','side','soupThick','sauceThick','lowSalt','note','measuredOn'];
+  const rows = [header.join(',')];
+  DB.records.forEach(r=>{
+    const p = residentById(r.residentId);
+    const bmi = bmiOf(r.weight, p?.heightCm);
+    const cells = [
+      p?.name || '',
+      p?.room || '',
+      p?.heightCm || '',
+      r.yearMonth,
+      r.weight,
+      bmi!=null ? bmi.toFixed(1) : '',
+      r.measureMode || 'normal',
+      r.rawWeight ?? '',
+      r.wheelchairKg ?? '',
+      mainLabel(r.stapleForm),
+      r.stapleAmount ?? '',
+      sideLabel(r.sideForm),
+      r.soupThick ? '有' : '',
+      r.sauceThick ? '有' : '',
+      r.lowSalt ? '有' : '',
+      r.note || '',
+      r.measuredOn || '',
+    ].map(c=>{
+      const s = String(c).replace(/"/g,'""');
+      return /[,\n"]/.test(s) ? `"${s}"` : s;
+    });
+    rows.push(cells.join(','));
+  });
+  const blob = new Blob(['\ufeff'+rows.join('\n')], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href=url; a.download=`weight-record-${new Date().toISOString().slice(0,10)}.csv`;
+  a.click(); URL.revokeObjectURL(url);
+});
+$('#cfgClear').addEventListener('click', ()=>{
+  if(!confirm('全データを削除します。本当によろしいですか？（元に戻せません）')) return;
+  // GAS連携URLは「アプリ設定」なので、データ削除では保持する
+  const keepUrl = (DB && DB.apiUrl) || apiUrl || '';
+  DB = deepClone(DEFAULT_DB);
+  if(keepUrl) DB.apiUrl = keepUrl;
+  save();
+  saveUI({inRes:'', ivRes:''});
+  renderCfg(); updateAlertBadge();
+  populateResidentSelect($('#inResident'));
+  populateResidentSelect($('#ivResident'));
+  toast('全データを削除しました' + (keepUrl ? '（GAS連携URLは保持）' : ''));
+});
+
+/* sample data */
+$('#cfgSample').addEventListener('click', ()=>{
+  if(DB.residents.length>0 && !confirm('既存データに追加します。続行しますか？')) return;
+  const names = [
+    {name:'山田 花子', room:'101', sex:'f', heightCm:148.5, m:'normal',    s:'normal', soupThick:false,sauceThick:false,lowSalt:false},
+    {name:'佐藤 太郎', room:'102', sex:'m', heightCm:162.0, m:'normal',    s:'bite',   soupThick:false,sauceThick:false,lowSalt:true},
+    {name:'鈴木 光子', room:'103', sex:'f', heightCm:150.2, m:'twice',     s:'chop',   soupThick:true, sauceThick:false,lowSalt:false},
+    {name:'田中 正二', room:'201', sex:'m', heightCm:168.3, m:'normal',    s:'bite',   soupThick:false,sauceThick:false,lowSalt:true},
+    {name:'高橋 和子', room:'202', sex:'f', heightCm:145.0, m:'full_porr', s:'fine',   soupThick:true, sauceThick:true, lowSalt:false},
+    {name:'渡辺 清',   room:'203', sex:'m', heightCm:155.8, wheelchairKg:10.5, m:'mix',       s:'mix',    soupThick:true, sauceThick:true, lowSalt:true},
+  ];
+  const now = new Date();
+  names.forEach((n,i)=>{
+    const r = {
+      id: uid(),
+      name: n.name, room: n.room, sex: n.sex, heightCm: n.heightCm,
+      wheelchairKg: n.wheelchairKg || null,
+      // 食事形態は入居者マスタに保存（サンプル投入直後でも入力画面で表示できるように）
+      stapleForm:   n.m,
+      stapleAmount: mainMap[n.m] ? mainMap[n.m].def : null,
+      sideForm:     n.s,
+      soupThick:    !!n.soupThick,
+      sauceThick:   !!n.sauceThick,
+      lowSalt:      !!n.lowSalt,
+      createdAt: new Date().toISOString(),
+    };
+    DB.residents.push(r);
+    const base = 48 + Math.random()*14;
+    let w = base;
+    for(let k=11; k>=0; k--){
+      const d = new Date(now.getFullYear(), now.getMonth()-k, 1);
+      const ym = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+      let noise = (Math.random()-0.5)*0.6;
+      if(i===2 && k<=2) noise -= 0.9;
+      if(i===4 && k<=3) noise += 0.75;
+      if(i===5 && k===0) noise -= 2.2;
+      w = Math.max(30, w + noise);
+      const netW = Math.round(w*10)/10;
+      const rec = {
+        id: uid(),
+        residentId: r.id,
+        yearMonth: ym,
+        weight: netW,
+        measuredOn: d.toISOString().slice(0,10),
+        measureMode: n.wheelchairKg ? 'chair' : 'normal',
+        rawWeight: n.wheelchairKg ? Math.round((netW + n.wheelchairKg)*10)/10 : null,
+        wheelchairKg: n.wheelchairKg || null,
+        stapleForm: n.m,
+        stapleAmount: mainMap[n.m] ? mainMap[n.m].def : null,
+        sideForm: n.s,
+        soupThick: n.soupThick,
+        sauceThick: n.sauceThick,
+        lowSalt: n.lowSalt,
+        note: '',
+        createdAt: new Date().toISOString(),
+      };
+      DB.records.push(rec);
+    }
+  });
+  save(); renderCfg(); updateAlertBadge();
+  populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+  populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+  toast('サンプルを投入しました');
+});
+
+/* ============================================================
+   Cloud sync wiring (settings UI + auto-pull on startup)
+   ============================================================ */
+/* URL 保存状態をUIに反映：三層のどこに保存されているかをユーザに見せる。
+   完全に揃っている=緑「保存済み」、一部欠落=黄「一部のみ保存」、全空=非表示。
+   保存・解除・診断・同期 のあらゆる経路から呼ばれる。 */
+function refreshUrlPersistBadge(){
+  const badge  = $('#apiPersistBadge');
+  const detail = $('#apiPersistDetail');
+  if(!badge || !detail) return;
+  let primary = '', secondary = '', tertiary = '';
+  try{ primary   = localStorage.getItem(API_KEY) || ''; }catch(e){}
+  try{ secondary = (typeof DB === 'object' && DB && DB.apiUrl) || ''; }catch(e){}
+  try{
+    const ui = JSON.parse(localStorage.getItem(LS_UI) || '{}');
+    tertiary = ui.apiUrl || '';
+  }catch(e){}
+  const layers = [
+    { name:'LS',    ok: !!primary,   match: primary   === apiUrl },
+    { name:'DB',    ok: !!secondary, match: secondary === apiUrl },
+    { name:'UI',    ok: !!tertiary,  match: tertiary  === apiUrl },
+  ];
+  const okCount = layers.filter(l => l.match).length;
+  if(!apiUrl){
+    badge.style.display = 'none';
+    detail.style.display = 'none';
+    return;
+  }
+  if(okCount === 3){
+    badge.style.display = '';
+    badge.classList.remove('is-partial');
+    badge.textContent = '✓ 保存済み';
+    detail.style.display = '';
+    detail.classList.remove('is-partial');
+    detail.textContent = `三層すべて一致 (LS / DB / UI) → …${apiUrl.slice(-30)}`;
+  } else {
+    badge.style.display = '';
+    badge.classList.add('is-partial');
+    badge.textContent = `△ ${okCount}/3 層のみ`;
+    detail.style.display = '';
+    detail.classList.add('is-partial');
+    detail.textContent = '保存状態: ' + layers.map(l => `${l.name}${l.match?'✓':'×'}`).join(' / ');
+  }
+}
+
+(function wireSync(){
+  // 起動時：3層 (LS / DB.apiUrl / UI.apiUrl) のいずれかから URL を復元し、全層を揃える
+  apiUrl = loadApiUrlOnBoot();
+  const cfgApi = $('#cfgApi');
+  if(cfgApi) cfgApi.value = apiUrl || '';
+  refreshUrlPersistBadge();
+  if(apiUrl){
+    apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + apiUrl.slice(-40));
+    // initial pull — non-blocking（現場端末ガード時はサーバ取得しない）
+    if(suGetDeviceRole() !== 'field') setTimeout(()=> syncFromAPI(true), 100);
+  }
+  /* 診断結果パネルの表示／非表示 */
+  function showDiagPanel(lines, ok){
+    const panel = $('#apiDiagOut');
+    if(!panel) return;
+    panel.style.display = '';
+    panel.classList.remove('is-ok','is-err');
+    panel.classList.add(ok ? 'is-ok' : 'is-err');
+    panel.textContent = lines.join('\n');
+  }
+  function hideDiagPanel(){
+    const panel = $('#apiDiagOut');
+    if(!panel) return;
+    panel.style.display = 'none';
+    panel.textContent = '';
+  }
+
+  $('#btnApiSave')?.addEventListener('click', async ()=>{
+    const url = $('#cfgApi').value.trim();
+    if(!url){ toast('URLを入力してください','err'); return; }
+    if(!url.startsWith('https://script.google.com/')){
+      toast('GAS Web App のURL (https://script.google.com/〜) を確認してください','err'); return;
+    }
+    // 三層（LS + DB + UI）に保存し、setItem の成功を読み戻して検証
+    const sv = saveApiUrl(url);
+    refreshUrlPersistBadge();
+    if(!sv.ok){
+      toast('⚠️ URLの保存に失敗しました（プライベートブラウズ等）。設定を確認してください','err');
+      apiSetStatus('er', 'URLの保存に失敗（LS×・DB×・UI×）');
+      return;
+    }
+    const failed = [];
+    if(!sv.lsOk) failed.push('LS');
+    if(!sv.dbOk) failed.push('DB');
+    if(!sv.uiOk) failed.push('UI');
+    if(failed.length){
+      toast(`⚠️ 一部の保存層が失敗（${failed.join(',')}）。他層から復元できます`,'err');
+    }
+    apiSetStatus('sy','接続中...');
+    hideDiagPanel();
+    const ok = await syncFromAPI(true);
+    if(ok){
+      toast('✅ URL を保存し同期しました（…' + url.slice(-30) + '）','ok');
+      apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + url.slice(-40));
+    } else {
+      // 失敗時は自動で診断を実行して具体的な原因を表示
+      toast('接続失敗。診断を実行します…','err');
+      const diag = await apiDiagnose(url);
+      showDiagPanel(diag.lines, diag.ok);
+    }
+    refreshUrlPersistBadge();
+  });
+  $('#btnApiDiagnose')?.addEventListener('click', async ()=>{
+    const url = ($('#cfgApi').value || apiUrl || '').trim();
+    if(!url){ toast('URLを入力してください','err'); return; }
+    showDiagPanel(['🔍 診断中…'], true);
+    const diag = await apiDiagnose(url);
+    showDiagPanel(diag.lines, diag.ok);
+    if(diag.ok) toast('✅ 接続OK','ok');
+  });
+  $('#btnApiSync')?.addEventListener('click', async ()=>{
+    if(!apiUrl){ toast('先にURLを保存してください','err'); return; }
+    hideDiagPanel();
+    const ok = await syncFromAPI(true);
+    if(ok) toast('✅ 同期完了','ok');
+    else {
+      const diag = await apiDiagnose(apiUrl);
+      showDiagPanel(diag.lines, diag.ok);
+    }
+    refreshUrlPersistBadge();
+  });
+  $('#btnApiClear')?.addEventListener('click', ()=>{
+    if(!confirm('サーバー連携を解除します。ローカルデータは残ります。続行しますか？')) return;
+    // 三層すべてからクリア
+    clearApiUrl();
+    if($('#cfgApi')) $('#cfgApi').value = '';
+    apiSetStatus('of');
+    $('#apiStatus').textContent = 'GASをデプロイして取得したURLを入力して「URLを保存・接続」を押してください。';
+    hideDiagPanel();
+    refreshUrlPersistBadge();
+    toast('連携を解除しました');
+  });
+  // replay any pending writes when the network comes back
+  window.addEventListener('online', ()=>{ if(apiUrl) flushPendingQueue(); });
+})();
+
+/* ============================================================
+   Init
+   ============================================================ */
+// 入居者マスタの共通情報を取り込み（連携キーが無ければ no-op）＋端末ガード
+try{ mergeCommonWeight(); }catch(e){ /* 取り込み失敗は運用を止めない */ }
+applyWeightDeviceGuard();
+(function(){ var b=document.getElementById('suDeviceUnlock'); if(b) b.addEventListener('click', function(){
+  try{ localStorage.setItem(SU_DEVICE_KEY,'office'); }catch(e){}
+  applyWeightDeviceGuard(); wrRefreshViews(); toast('この端末を事務所PCに設定しました');
+}); })();
+(function(){ var t=document.getElementById('wrShowNonTarget'); if(t) t.addEventListener('change', function(){
+  wrShowNonTargets = this.checked; wrRefreshViews();
+}); })();
+
+// populate both selects immediately so they're usable even before
+// the user switches tabs (prevents selection from appearing empty
+// after a page reload).
+populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+goto(['list','input','indiv','grid','alert','cfg'].includes(UI.tab) ? UI.tab : 'list');
+updateAlertBadge();
+
+/* sticky thead が topbar の真下にぴったり貼り付くよう、CSS変数 --topbar-h を
+   実測値で更新する。リサイズ・タブ切替で高さが変わる可能性に追従。 */
+function applyStickyTopOffset(){
+  const topbar = document.querySelector('.topbar');
+  if(!topbar) return;
+  const h = topbar.getBoundingClientRect().height;
+  if(h > 0) document.documentElement.style.setProperty('--topbar-h', Math.ceil(h) + 'px');
+}
+applyStickyTopOffset();
+window.addEventListener('resize', applyStickyTopOffset);
+window.addEventListener('orientationchange', applyStickyTopOffset);
+// レイアウトが安定した後にも一度
+setTimeout(applyStickyTopOffset, 200);
+
+/* close modal when clicking outside */
+$('#mdResident').addEventListener('click', e=>{
+  if(e.target.id==='mdResident') $('#mdResident').classList.remove('on');
+});
+</script>
+</body>
+</html>
