@@ -565,6 +565,16 @@ select option.is-discharged{color:var(--g6)}
 </head>
 <body>
 
+<!-- 端末用途ガード（事務所PC専用。現場タブレットでは体重管理を開かせない＝誤操作防止） -->
+<div id="suDeviceBlock" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(255,255,255,.97);align-items:center;justify-content:center;padding:20px">
+  <div style="max-width:440px;text-align:center;background:#fff;border:1px solid #e0e0e0;border-radius:14px;box-shadow:0 4px 24px rgba(0,0,0,.18);padding:26px">
+    <div style="font-size:44px">🔒</div>
+    <h2 style="margin:8px 0;font-size:18px">この端末は現場用に設定されています</h2>
+    <p style="color:#666;font-size:14px;line-height:1.7">体重管理は<b>事務所PC</b>でご利用ください。</p>
+    <button id="suDeviceUnlock" style="margin-top:14px;padding:10px 16px;border:1px solid #1a73e8;background:#fff;color:#1a73e8;border-radius:10px;font-weight:700;cursor:pointer">管理者：この端末を事務所PCにする</button>
+  </div>
+</div>
+
 <div class="topbar">
 <header class="hdr">
   <div>
@@ -621,7 +631,10 @@ select option.is-discharged{color:var(--g6)}
   <div class="cd">
     <div class="cd-t">
       <span>入居者一覧</span>
-      <span class="cd-t-r" id="listCount">—</span>
+      <span class="cd-t-r" style="display:flex;align-items:center;gap:8px">
+        <button id="btnPrintSheet" class="bn bp bsm" title="入居者全員の前月体重と今月の記入欄を A4 で印刷">🖨️ 用紙作成</button>
+        <span id="listCount">—</span>
+      </span>
     </div>
     <div class="mp-w">
       <span style="font-size:12px;color:var(--g7);font-weight:700;margin-right:4px">対象月</span>
@@ -629,6 +642,7 @@ select option.is-discharged{color:var(--g6)}
       <button id="listMonthPrev">◀</button>
       <button id="listMonthNext">▶</button>
       <button id="listMonthNow" style="margin-left:6px">今月</button>
+      <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--g7);margin-left:12px;cursor:pointer"><input type="checkbox" id="wrShowNonTarget">対象外も表示</label>
     </div>
     <div class="srch">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
@@ -1793,6 +1807,8 @@ async function syncFromAPI(showLoader){
     };
     DB.residents = mergeById(apiRes, DB.residents);
     DB.records   = mergeById(apiRec, DB.records);
+    // 入居者マスタの共通情報を同期後にも反映（master を正として居室・対象を更新）
+    try{ if(typeof mergeCommonWeight === 'function') mergeCommonWeight(); }catch(e){}
     save();
 
     if(apiThr){
@@ -2108,10 +2124,81 @@ function normalizeAllRecords(){
    - 退去者は常に末尾に並ぶ（活動中→退去者の順）
    サーバから来たデータで room/name が数値型のままになっていても例外を出さず、
    この場で文字列化して比較する（_toSafeStr）。 */
+/* ============================================================
+   入居者マスタ連携（共通情報の自動コピー / 体重対象選択 / 端末ガード）
+   - すべて no-op 安全：連携キー（su_residents_common / su_device_role）が
+     無ければ従来挙動を一切変えない。既存の体重記録は決して削除しない。
+   ============================================================ */
+var SU_COMMON_KEY = 'su_residents_common';
+var SU_DEVICE_KEY = 'su_device_role';
+var wrShowNonTargets = false;
+function suNormName(s){ return String(s==null?'':s).replace(/\s+/g,'').trim(); }
+/* 体重記録の対象者か（targetWeight===false のみ対象外。未設定/true は対象＝no-op安全） */
+function isWeightTarget(r){ return !r || r.targetWeight !== false; }
+/* 入居者マスタの共通情報を取り込み（体重記録アプリ用） */
+function mergeCommonWeight(){
+  var raw; try{ raw = localStorage.getItem(SU_COMMON_KEY); }catch(e){ return false; }
+  if(!raw) return false;
+  var data; try{ data = JSON.parse(raw); }catch(e){ return false; }
+  var list = (data && Array.isArray(data.residents)) ? data.residents : null;
+  if(!list || !list.length) return false;
+  if(!Array.isArray(DB.residents)) DB.residents = [];
+  var byMid = {}, byName = {};
+  DB.residents.forEach(function(r){
+    if(!r || typeof r !== 'object') return;
+    if(r.masterId != null) byMid[String(r.masterId)] = r;
+    var nm = suNormName(r.name); if(nm && !byName[nm]) byName[nm] = r;
+  });
+  var changed = 0;
+  list.forEach(function(c){
+    if(!c || c.masterId == null || c.active === false) return;
+    var tW = Array.isArray(c.targetApps) ? (c.targetApps.indexOf('weight') >= 0) : undefined;
+    var tgt = byMid[String(c.masterId)];
+    if(!tgt){ var nm = suNormName(c.name); if(nm) tgt = byName[nm]; }
+    if(tgt){
+      if(tgt.masterId == null){ tgt.masterId = c.masterId; changed++; }
+      if(c.room && _toSafeStr(tgt.room) !== _toSafeStr(c.room)){ tgt.room = _toSafeStr(c.room); changed++; }
+      if(tW !== undefined && tgt.targetWeight !== tW){ tgt.targetWeight = tW; changed++; }
+    }else{
+      if(tW === false) return;   // 体重対象外の master 入居者は取り込まない
+      if(!c.room) return;        // 居室なしは取り込まない
+      var nr = { id: uid(), name: _toSafeStr(c.name), room: _toSafeStr(c.room),
+                 masterId: c.masterId, targetWeight: (tW===undefined?true:tW), _fromMaster: true,
+                 createdAt: new Date().toISOString() };
+      normalizeResident(nr);
+      DB.residents.push(nr);
+      changed++;
+    }
+  });
+  if(changed){ save(); }
+  return changed > 0;
+}
+/* 端末ガード（事務所PC専用。共有キー su_device_role==='field' で起動時ブロック） */
+function suGetDeviceRole(){ try{ return localStorage.getItem(SU_DEVICE_KEY) || 'office'; }catch(e){ return 'office'; } }
+function applyWeightDeviceGuard(){
+  var blocked = (suGetDeviceRole() === 'field');
+  var ov = document.getElementById('suDeviceBlock');
+  if(ov) ov.style.display = blocked ? 'flex' : 'none';
+  return blocked;
+}
+/* 現在の主要ビューを再描画（トグル/取り込み後の反映用） */
+function wrRefreshViews(){
+  try{
+    if(typeof renderList === 'function') renderList();
+    if(typeof renderGrid === 'function' && document.querySelector('.scr[data-sc="grid"].on')) renderGrid();
+    if(typeof populateResidentSelect === 'function'){
+      populateResidentSelect($('#inResident'), {preferId: UI.inRes});
+      populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
+    }
+    if(typeof updateAlertBadge === 'function') updateAlertBadge();
+  }catch(e){ /* 描画失敗は運用を止めない */ }
+}
+
 function sortedResidents(opts){
   const include = !!(opts && opts.includeDischarged);
+  const showNon = !!(opts && opts.includeNonTargets) || wrShowNonTargets;
   const list = (DB.residents || []).filter(r =>
-    r && typeof r === 'object' && (include || !isDischarged(r))
+    r && typeof r === 'object' && (include || !isDischarged(r)) && (showNon || isWeightTarget(r))
   );
   return list.slice().sort((a, b) => {
     const ad = isDischarged(a) ? 1 : 0;
@@ -2268,6 +2355,206 @@ $('#listFilter').addEventListener('click', e=>{
   $$('#listFilter button').forEach(x=> x.classList.toggle('on', x===b));
   renderList();
 });
+
+/* ============================================================
+   用紙作成（体重測定用紙の印刷）
+   ------------------------------------------------------------
+   - 入居者一覧画面の「🖨️ 用紙作成」ボタンから起動
+   - 対象月（listMonth）の **前月** の体重を入居者ごとに表示
+   - 車椅子使用者は「実測値（含む車椅子）」「車椅子重量」を別欄に
+   - 今月の測定値を記入できるブランクセルを用意
+   - 全員分が A4 用紙１枚に収まるよう、人数に応じてフォントを自動圧縮
+   ============================================================ */
+function openPrintSheet(){
+  // 印刷対象月（list の対象月）と前月を計算
+  const targetYm = listMonth || ymNow();
+  const prevYm = ymPrev(targetYm, 1);
+  // 在籍中（退去者を除く）の入居者を部屋・名前で安全ソート
+  const residents = (typeof sortedResidents === 'function')
+    ? sortedResidents({ includeDischarged: false })
+    : (DB.residents || []).filter(r => r && !isDischarged(r));
+  if(residents.length === 0){
+    toast('印刷する入居者がいません', 'err');
+    return;
+  }
+  // 人数に応じてフォントサイズと行高を自動調整（A4 縦：約 257mm の印刷可能高）
+  // 行高(mm) = ヘッダ/フッタを除いた約 220mm を人数で割る → 1行最低 6mm を確保
+  const n = residents.length;
+  let rowH, fz, padV;
+  if(n <= 14)      { rowH = 13; fz = 11; padV = 4; }
+  else if(n <= 22) { rowH = 9.5; fz = 10; padV = 3; }
+  else if(n <= 30) { rowH = 7.4; fz = 9; padV = 2; }
+  else if(n <= 40) { rowH = 5.5; fz = 8; padV = 1.5; }
+  else             { rowH = 4.5; fz = 7; padV = 1; }   // 41名以上は最小設定
+
+  // 各入居者の前月情報を準備
+  function _bodyRow(r, idx){
+    const prevRec = (typeof getRecord === 'function') ? getRecord(r.id, prevYm) : null;
+    const isChair = (r.wheelchairKg != null && r.wheelchairKg > 0);
+    // 前月「実測値」: chair モードなら rawWeight、通常モードなら weight
+    let prevReal = '';
+    let prevChair = '';
+    let prevNet = '';
+    if(prevRec){
+      if(prevRec.measureMode === 'chair' && prevRec.rawWeight != null){
+        prevReal  = prevRec.rawWeight.toFixed(1);
+        prevChair = (prevRec.wheelchairKg != null) ? prevRec.wheelchairKg.toFixed(1) : '';
+        prevNet   = prevRec.weight.toFixed(1);
+      } else {
+        prevReal = prevRec.weight.toFixed(1);
+      }
+    }
+    // 車椅子（マスター登録値）を補助情報として表示
+    const chairKg = isChair ? r.wheelchairKg.toFixed(1) : '';
+    const room = (r.room != null && r.room !== '') ? r.room : '－';
+    const name = r.name || '（名前未設定）';
+    // 今月の測定値を書き込むブランク欄を 3 つ（実測値・車椅子重量・差引体重）用意。
+    // 通常モードは「実測値」のみ。車椅子モードは３つすべて意味があるので３列確保。
+    const blankCells = isChair
+      ? `<td class="bl">${' '.repeat(12)}</td><td class="bl">${' '.repeat(8)}</td><td class="bl">${' '.repeat(8)}</td>`
+      : `<td class="bl" colspan="3">${' '.repeat(12)}</td>`;
+
+    return `
+      <tr>
+        <td class="no">${idx + 1}</td>
+        <td class="rm">${escapeHtml(String(room))}</td>
+        <td class="nm">${escapeHtml(name)}${isChair ? '<span class="wcb">車</span>' : ''}</td>
+        <td class="prev">${prevReal || '－'}</td>
+        <td class="prev-chair">${prevChair || (isChair ? chairKg : '')}</td>
+        <td class="prev-net">${prevNet || ''}</td>
+        ${blankCells}
+        <td class="memo"></td>
+      </tr>`;
+  }
+
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}年${today.getMonth()+1}月${today.getDate()}日`;
+
+  const html = `
+<!DOCTYPE html>
+<html lang="ja"><head>
+<meta charset="utf-8">
+<title>体重測定用紙 ${ymFmt(targetYm)}</title>
+<style>
+  @page { size: A4 portrait; margin: 10mm 12mm; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Hiragino Sans","Yu Gothic UI","Meiryo",sans-serif;color:#000}
+  .ph-hd{display:flex;align-items:flex-end;justify-content:space-between;
+    border-bottom:2px solid #000;padding-bottom:4px;margin-bottom:6px}
+  .ph-ttl{font-size:16pt;font-weight:700;letter-spacing:1px}
+  .ph-sub{font-size:9pt;color:#333}
+  .ph-meta{font-size:9pt;text-align:right;line-height:1.55}
+  table{width:100%;border-collapse:collapse;table-layout:fixed;
+    font-size:${fz}pt;font-variant-numeric:tabular-nums}
+  th,td{border:1px solid #555;padding:${padV}px 3px;text-align:center;
+    height:${rowH}mm;line-height:1.15;overflow:hidden}
+  thead th{background:#e8eaed;font-weight:700;font-size:${Math.max(fz-1, 7)}pt;
+    line-height:1.15;padding:3px 2px;height:auto}
+  td.no{width:22px;color:#555;font-size:${Math.max(fz-1, 7)}pt}
+  td.rm{width:32px;font-weight:700}
+  td.nm{text-align:left;padding-left:4px;font-weight:700;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .wcb{display:inline-block;margin-left:3px;padding:0 4px;background:#1565c0;
+    color:#fff;border-radius:3px;font-size:${Math.max(fz-2, 6)}pt;vertical-align:middle}
+  td.prev,td.prev-chair,td.prev-net{width:8%;font-weight:700;background:#fafafa}
+  td.prev-net{color:#0d47a1}
+  td.bl{background:#fff}
+  td.memo{width:18%;font-size:${Math.max(fz-1, 7)}pt}
+  .ph-ft{margin-top:6px;font-size:8pt;color:#444;display:flex;
+    justify-content:space-between;border-top:1px solid #999;padding-top:3px}
+  .ph-note{font-size:8pt;color:#555;margin-top:3px;line-height:1.45}
+  .ph-note b{color:#0d47a1}
+  /* 印刷時にはツールバー類を非表示 */
+  @media print{
+    .no-print{display:none !important}
+    body{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  }
+  /* ブラウザ閲覧時用のトップバー */
+  .toolbar{position:sticky;top:0;background:#1565c0;color:#fff;
+    padding:8px 12px;display:flex;gap:8px;align-items:center;z-index:100;
+    box-shadow:0 2px 6px rgba(0,0,0,.18)}
+  .toolbar button{background:#fff;color:#1565c0;border:none;padding:6px 14px;
+    border-radius:4px;font-weight:700;cursor:pointer;font-size:13px}
+  .toolbar button:hover{background:#e3f2fd}
+  .toolbar .ph-info{flex:1;font-size:13px}
+  .ph-wrap{padding:8mm 12mm;background:#fff;max-width:210mm;margin:0 auto}
+</style>
+</head><body>
+<div class="toolbar no-print">
+  <span class="ph-info">📄 ${ymFmt(targetYm)} 体重測定用紙（プレビュー）— 印刷ボタンで A4 横１枚に出力されます</span>
+  <button onclick="window.print()">🖨️ 印刷</button>
+  <button onclick="window.close()">✖ 閉じる</button>
+</div>
+<div class="ph-wrap">
+  <div class="ph-hd">
+    <div>
+      <div class="ph-ttl">体重測定記録用紙</div>
+      <div class="ph-sub">対象月：${ymFmt(targetYm)}</div>
+    </div>
+    <div class="ph-meta">
+      <div>作成日：${todayStr}</div>
+      <div>在籍 ${residents.length} 名</div>
+    </div>
+  </div>
+  <table>
+    <colgroup>
+      <col style="width:22px"><col style="width:32px"><col>
+      <col style="width:8%"><col style="width:8%"><col style="width:8%">
+      <col style="width:8%"><col style="width:8%"><col style="width:8%">
+      <col style="width:18%">
+    </colgroup>
+    <thead>
+      <tr>
+        <th rowspan="2">№</th>
+        <th rowspan="2">部屋</th>
+        <th rowspan="2">氏名</th>
+        <th colspan="3" style="background:#fff3e0">前月（${ymFmt(prevYm)}）</th>
+        <th colspan="3" style="background:#e3f2fd">今月（${ymFmt(targetYm)}）測定値 ✏️</th>
+        <th rowspan="2">備考</th>
+      </tr>
+      <tr>
+        <th style="background:#fff3e0">実測<br><small>(kg)</small></th>
+        <th style="background:#fff3e0">車椅子<br><small>(kg)</small></th>
+        <th style="background:#fff3e0">差引<br><small>(kg)</small></th>
+        <th style="background:#e3f2fd">実測<br><small>(kg)</small></th>
+        <th style="background:#e3f2fd">車椅子<br><small>(kg)</small></th>
+        <th style="background:#e3f2fd">差引<br><small>(kg)</small></th>
+      </tr>
+    </thead>
+    <tbody>
+      ${residents.map((r, i) => _bodyRow(r, i)).join('')}
+    </tbody>
+  </table>
+  <div class="ph-note">
+    <b>記入要領：</b>
+    通常モードの方は「実測」欄のみ。車椅子の方は「実測（車椅子込み）」と「車椅子重量」、差引体重を必要に応じて記入してください。
+    「車」マークは車椅子使用者です。前月の差引（青字）は前月実測 − 車椅子の値です。
+  </div>
+  <div class="ph-ft">
+    <span>記録者：　　　　　　　　　　　</span>
+    <span>確認者：　　　　　　　　　　　</span>
+  </div>
+</div>
+<scr` + `ipt>
+  if(location.search.indexOf('print=1') >= 0){
+    setTimeout(function(){ window.print(); }, 250);
+  }
+</scr` + `ipt>
+</body></html>`;
+
+  // 新しいタブを開いて HTML を流し込む
+  const w = window.open('', '_blank');
+  if(!w){
+    toast('ポップアップがブロックされました。許可してください。', 'err');
+    return;
+  }
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+}
+
+/* 「🖨️ 用紙作成」ボタンの配線 */
+$('#btnPrintSheet')?.addEventListener('click', openPrintSheet);
 
 function renderList(){
   const body = $('#listBody');
@@ -4782,290 +5069,3 @@ $('#cfgFile').addEventListener('change', async e=>{
   }finally{ e.target.value=''; }
 });
 $('#cfgCsv').addEventListener('click', ()=>{
-  const header = ['name','room','heightCm','yearMonth','weight','bmi','measureMode','rawWeight','wheelchairKg','staple','stapleAmount','side','soupThick','sauceThick','lowSalt','note','measuredOn'];
-  const rows = [header.join(',')];
-  DB.records.forEach(r=>{
-    const p = residentById(r.residentId);
-    const bmi = bmiOf(r.weight, p?.heightCm);
-    const cells = [
-      p?.name || '',
-      p?.room || '',
-      p?.heightCm || '',
-      r.yearMonth,
-      r.weight,
-      bmi!=null ? bmi.toFixed(1) : '',
-      r.measureMode || 'normal',
-      r.rawWeight ?? '',
-      r.wheelchairKg ?? '',
-      mainLabel(r.stapleForm),
-      r.stapleAmount ?? '',
-      sideLabel(r.sideForm),
-      r.soupThick ? '有' : '',
-      r.sauceThick ? '有' : '',
-      r.lowSalt ? '有' : '',
-      r.note || '',
-      r.measuredOn || '',
-    ].map(c=>{
-      const s = String(c).replace(/"/g,'""');
-      return /[,\n"]/.test(s) ? `"${s}"` : s;
-    });
-    rows.push(cells.join(','));
-  });
-  const blob = new Blob(['\ufeff'+rows.join('\n')], {type:'text/csv'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href=url; a.download=`weight-record-${new Date().toISOString().slice(0,10)}.csv`;
-  a.click(); URL.revokeObjectURL(url);
-});
-$('#cfgClear').addEventListener('click', ()=>{
-  if(!confirm('全データを削除します。本当によろしいですか？（元に戻せません）')) return;
-  // GAS連携URLは「アプリ設定」なので、データ削除では保持する
-  const keepUrl = (DB && DB.apiUrl) || apiUrl || '';
-  DB = structuredClone(DEFAULT_DB);
-  if(keepUrl) DB.apiUrl = keepUrl;
-  save();
-  saveUI({inRes:'', ivRes:''});
-  renderCfg(); updateAlertBadge();
-  populateResidentSelect($('#inResident'));
-  populateResidentSelect($('#ivResident'));
-  toast('全データを削除しました' + (keepUrl ? '（GAS連携URLは保持）' : ''));
-});
-
-/* sample data */
-$('#cfgSample').addEventListener('click', ()=>{
-  if(DB.residents.length>0 && !confirm('既存データに追加します。続行しますか？')) return;
-  const names = [
-    {name:'山田 花子', room:'101', sex:'f', heightCm:148.5, m:'normal',    s:'normal', soupThick:false,sauceThick:false,lowSalt:false},
-    {name:'佐藤 太郎', room:'102', sex:'m', heightCm:162.0, m:'normal',    s:'bite',   soupThick:false,sauceThick:false,lowSalt:true},
-    {name:'鈴木 光子', room:'103', sex:'f', heightCm:150.2, m:'twice',     s:'chop',   soupThick:true, sauceThick:false,lowSalt:false},
-    {name:'田中 正二', room:'201', sex:'m', heightCm:168.3, m:'normal',    s:'bite',   soupThick:false,sauceThick:false,lowSalt:true},
-    {name:'高橋 和子', room:'202', sex:'f', heightCm:145.0, m:'full_porr', s:'fine',   soupThick:true, sauceThick:true, lowSalt:false},
-    {name:'渡辺 清',   room:'203', sex:'m', heightCm:155.8, wheelchairKg:10.5, m:'mix',       s:'mix',    soupThick:true, sauceThick:true, lowSalt:true},
-  ];
-  const now = new Date();
-  names.forEach((n,i)=>{
-    const r = {
-      id: uid(),
-      name: n.name, room: n.room, sex: n.sex, heightCm: n.heightCm,
-      wheelchairKg: n.wheelchairKg || null,
-      // 食事形態は入居者マスタに保存（サンプル投入直後でも入力画面で表示できるように）
-      stapleForm:   n.m,
-      stapleAmount: mainMap[n.m] ? mainMap[n.m].def : null,
-      sideForm:     n.s,
-      soupThick:    !!n.soupThick,
-      sauceThick:   !!n.sauceThick,
-      lowSalt:      !!n.lowSalt,
-      createdAt: new Date().toISOString(),
-    };
-    DB.residents.push(r);
-    const base = 48 + Math.random()*14;
-    let w = base;
-    for(let k=11; k>=0; k--){
-      const d = new Date(now.getFullYear(), now.getMonth()-k, 1);
-      const ym = d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
-      let noise = (Math.random()-0.5)*0.6;
-      if(i===2 && k<=2) noise -= 0.9;
-      if(i===4 && k<=3) noise += 0.75;
-      if(i===5 && k===0) noise -= 2.2;
-      w = Math.max(30, w + noise);
-      const netW = Math.round(w*10)/10;
-      const rec = {
-        id: uid(),
-        residentId: r.id,
-        yearMonth: ym,
-        weight: netW,
-        measuredOn: d.toISOString().slice(0,10),
-        measureMode: n.wheelchairKg ? 'chair' : 'normal',
-        rawWeight: n.wheelchairKg ? Math.round((netW + n.wheelchairKg)*10)/10 : null,
-        wheelchairKg: n.wheelchairKg || null,
-        stapleForm: n.m,
-        stapleAmount: mainMap[n.m] ? mainMap[n.m].def : null,
-        sideForm: n.s,
-        soupThick: n.soupThick,
-        sauceThick: n.sauceThick,
-        lowSalt: n.lowSalt,
-        note: '',
-        createdAt: new Date().toISOString(),
-      };
-      DB.records.push(rec);
-    }
-  });
-  save(); renderCfg(); updateAlertBadge();
-  populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-  populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
-  toast('サンプルを投入しました');
-});
-
-/* ============================================================
-   Cloud sync wiring (settings UI + auto-pull on startup)
-   ============================================================ */
-/* URL 保存状態をUIに反映：三層のどこに保存されているかをユーザに見せる。
-   完全に揃っている=緑「保存済み」、一部欠落=黄「一部のみ保存」、全空=非表示。
-   保存・解除・診断・同期 のあらゆる経路から呼ばれる。 */
-function refreshUrlPersistBadge(){
-  const badge  = $('#apiPersistBadge');
-  const detail = $('#apiPersistDetail');
-  if(!badge || !detail) return;
-  let primary = '', secondary = '', tertiary = '';
-  try{ primary   = localStorage.getItem(API_KEY) || ''; }catch(e){}
-  try{ secondary = (typeof DB === 'object' && DB && DB.apiUrl) || ''; }catch(e){}
-  try{
-    const ui = JSON.parse(localStorage.getItem(LS_UI) || '{}');
-    tertiary = ui.apiUrl || '';
-  }catch(e){}
-  const layers = [
-    { name:'LS',    ok: !!primary,   match: primary   === apiUrl },
-    { name:'DB',    ok: !!secondary, match: secondary === apiUrl },
-    { name:'UI',    ok: !!tertiary,  match: tertiary  === apiUrl },
-  ];
-  const okCount = layers.filter(l => l.match).length;
-  if(!apiUrl){
-    badge.style.display = 'none';
-    detail.style.display = 'none';
-    return;
-  }
-  if(okCount === 3){
-    badge.style.display = '';
-    badge.classList.remove('is-partial');
-    badge.textContent = '✓ 保存済み';
-    detail.style.display = '';
-    detail.classList.remove('is-partial');
-    detail.textContent = `三層すべて一致 (LS / DB / UI) → …${apiUrl.slice(-30)}`;
-  } else {
-    badge.style.display = '';
-    badge.classList.add('is-partial');
-    badge.textContent = `△ ${okCount}/3 層のみ`;
-    detail.style.display = '';
-    detail.classList.add('is-partial');
-    detail.textContent = '保存状態: ' + layers.map(l => `${l.name}${l.match?'✓':'×'}`).join(' / ');
-  }
-}
-
-(function wireSync(){
-  // 起動時：3層 (LS / DB.apiUrl / UI.apiUrl) のいずれかから URL を復元し、全層を揃える
-  apiUrl = loadApiUrlOnBoot();
-  const cfgApi = $('#cfgApi');
-  if(cfgApi) cfgApi.value = apiUrl || '';
-  refreshUrlPersistBadge();
-  if(apiUrl){
-    apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + apiUrl.slice(-40));
-    // initial pull — non-blocking
-    setTimeout(()=> syncFromAPI(true), 100);
-  }
-  /* 診断結果パネルの表示／非表示 */
-  function showDiagPanel(lines, ok){
-    const panel = $('#apiDiagOut');
-    if(!panel) return;
-    panel.style.display = '';
-    panel.classList.remove('is-ok','is-err');
-    panel.classList.add(ok ? 'is-ok' : 'is-err');
-    panel.textContent = lines.join('\n');
-  }
-  function hideDiagPanel(){
-    const panel = $('#apiDiagOut');
-    if(!panel) return;
-    panel.style.display = 'none';
-    panel.textContent = '';
-  }
-
-  $('#btnApiSave')?.addEventListener('click', async ()=>{
-    const url = $('#cfgApi').value.trim();
-    if(!url){ toast('URLを入力してください','err'); return; }
-    if(!url.startsWith('https://script.google.com/')){
-      toast('GAS Web App のURL (https://script.google.com/〜) を確認してください','err'); return;
-    }
-    // 三層（LS + DB + UI）に保存し、setItem の成功を読み戻して検証
-    const sv = saveApiUrl(url);
-    refreshUrlPersistBadge();
-    if(!sv.ok){
-      toast('⚠️ URLの保存に失敗しました（プライベートブラウズ等）。設定を確認してください','err');
-      apiSetStatus('er', 'URLの保存に失敗（LS×・DB×・UI×）');
-      return;
-    }
-    const failed = [];
-    if(!sv.lsOk) failed.push('LS');
-    if(!sv.dbOk) failed.push('DB');
-    if(!sv.uiOk) failed.push('UI');
-    if(failed.length){
-      toast(`⚠️ 一部の保存層が失敗（${failed.join(',')}）。他層から復元できます`,'err');
-    }
-    apiSetStatus('sy','接続中...');
-    hideDiagPanel();
-    const ok = await syncFromAPI(true);
-    if(ok){
-      toast('✅ URL を保存し同期しました（…' + url.slice(-30) + '）','ok');
-      apiSetStatus('ok', '✅ 接続URL（保存済み）: …' + url.slice(-40));
-    } else {
-      // 失敗時は自動で診断を実行して具体的な原因を表示
-      toast('接続失敗。診断を実行します…','err');
-      const diag = await apiDiagnose(url);
-      showDiagPanel(diag.lines, diag.ok);
-    }
-    refreshUrlPersistBadge();
-  });
-  $('#btnApiDiagnose')?.addEventListener('click', async ()=>{
-    const url = ($('#cfgApi').value || apiUrl || '').trim();
-    if(!url){ toast('URLを入力してください','err'); return; }
-    showDiagPanel(['🔍 診断中…'], true);
-    const diag = await apiDiagnose(url);
-    showDiagPanel(diag.lines, diag.ok);
-    if(diag.ok) toast('✅ 接続OK','ok');
-  });
-  $('#btnApiSync')?.addEventListener('click', async ()=>{
-    if(!apiUrl){ toast('先にURLを保存してください','err'); return; }
-    hideDiagPanel();
-    const ok = await syncFromAPI(true);
-    if(ok) toast('✅ 同期完了','ok');
-    else {
-      const diag = await apiDiagnose(apiUrl);
-      showDiagPanel(diag.lines, diag.ok);
-    }
-    refreshUrlPersistBadge();
-  });
-  $('#btnApiClear')?.addEventListener('click', ()=>{
-    if(!confirm('サーバー連携を解除します。ローカルデータは残ります。続行しますか？')) return;
-    // 三層すべてからクリア
-    clearApiUrl();
-    if($('#cfgApi')) $('#cfgApi').value = '';
-    apiSetStatus('of');
-    $('#apiStatus').textContent = 'GASをデプロイして取得したURLを入力して「URLを保存・接続」を押してください。';
-    hideDiagPanel();
-    refreshUrlPersistBadge();
-    toast('連携を解除しました');
-  });
-  // replay any pending writes when the network comes back
-  window.addEventListener('online', ()=>{ if(apiUrl) flushPendingQueue(); });
-})();
-
-/* ============================================================
-   Init
-   ============================================================ */
-// populate both selects immediately so they're usable even before
-// the user switches tabs (prevents selection from appearing empty
-// after a page reload).
-populateResidentSelect($('#inResident'), {preferId: UI.inRes});
-populateResidentSelect($("#ivResident"), {preferId: UI.ivRes, fallbackFirst:true, includeDischarged:true});
-goto(['list','input','indiv','grid','alert','cfg'].includes(UI.tab) ? UI.tab : 'list');
-updateAlertBadge();
-
-/* sticky thead が topbar の真下にぴったり貼り付くよう、CSS変数 --topbar-h を
-   実測値で更新する。リサイズ・タブ切替で高さが変わる可能性に追従。 */
-function applyStickyTopOffset(){
-  const topbar = document.querySelector('.topbar');
-  if(!topbar) return;
-  const h = topbar.getBoundingClientRect().height;
-  if(h > 0) document.documentElement.style.setProperty('--topbar-h', Math.ceil(h) + 'px');
-}
-applyStickyTopOffset();
-window.addEventListener('resize', applyStickyTopOffset);
-window.addEventListener('orientationchange', applyStickyTopOffset);
-// レイアウトが安定した後にも一度
-setTimeout(applyStickyTopOffset, 200);
-
-/* close modal when clicking outside */
-$('#mdResident').addEventListener('click', e=>{
-  if(e.target.id==='mdResident') $('#mdResident').classList.remove('on');
-});
-</script>
-</body>
-</html>
